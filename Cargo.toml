@@ -1,0 +1,52 @@
+[package]
+name = "alecto"
+version = "0.1.0"
+edition = "2024"
+repository = "https://github.com/rendro/alecto"
+authors = ["rendro"]
+description = "Semantic memory for AI agents - local-first, MCP-native"
+
+[[bin]]
+name = "alecto"
+path = "src/main.rs"
+
+[dependencies]
+# Database - LanceDB for vector storage
+lancedb = "0.17"
+# Arrow crates - must match lancedb's version (v53)
+arrow-array = "53"
+arrow-schema = "53"
+
+# Embeddings - using candle for simpler integration
+candle-core = "0.8"
+candle-nn = "0.8"
+candle-transformers = "0.8"
+hf-hub = "0.4"
+tokenizers = "0.21"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Async
+tokio = { version = "1", features = ["full"] }
+
+# MCP
+jsonrpc-core = "18"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+dialoguer = "0.11"
+
+# Utils
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dirs = "5"
+futures = "0.3"
+
+[dev-dependencies]
+tempfile = "3"

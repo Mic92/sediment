@@ -1,0 +1,19 @@
+# Rust
+/target/
+Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Alecto local data
+.alecto/
+
+# Cloned repos (for local testing)
+homebrew-tap/

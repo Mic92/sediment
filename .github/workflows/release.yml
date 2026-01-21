@@ -1,0 +1,132 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            os: macos-13
+            name: alecto-x86_64-apple-darwin
+          - target: aarch64-apple-darwin
+            os: macos-14
+            name: alecto-aarch64-apple-darwin
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            name: alecto-x86_64-unknown-linux-gnu
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/alecto dist/
+          cd dist
+          tar -czvf ../${{ matrix.name }}.tar.gz alecto
+          cd ..
+          shasum -a 256 ${{ matrix.name }}.tar.gz > ${{ matrix.name }}.tar.gz.sha256
+
+      - name: Upload Release Assets
+        uses: softprops/action-gh-release@v1
+        with:
+          prerelease: ${{ contains(github.ref, 'alpha') || contains(github.ref, 'beta') || contains(github.ref, 'rc') }}
+          files: |
+            ${{ matrix.name }}.tar.gz
+            ${{ matrix.name }}.tar.gz.sha256
+
+  update-homebrew:
+    needs: build
+    runs-on: ubuntu-latest
+    # Only update homebrew for stable releases (no alpha/beta/rc)
+    if: ${{ !contains(github.ref, 'alpha') && !contains(github.ref, 'beta') && !contains(github.ref, 'rc') }}
+    steps:
+      - name: Get version
+        id: version
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Download SHA256 files
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release download v${{ steps.version.outputs.version }} \
+            --repo ${{ github.repository }} \
+            --pattern "*.sha256"
+
+      - name: Clone homebrew-tap
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          git clone https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/rendro/homebrew-tap.git
+
+      - name: Update formula
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          SHA_INTEL=$(cat alecto-x86_64-apple-darwin.tar.gz.sha256 | awk '{print $1}')
+          SHA_ARM=$(cat alecto-aarch64-apple-darwin.tar.gz.sha256 | awk '{print $1}')
+          SHA_LINUX=$(cat alecto-x86_64-unknown-linux-gnu.tar.gz.sha256 | awk '{print $1}')
+
+          cat > homebrew-tap/Formula/alecto.rb <<EOF
+          class Alecto < Formula
+            desc "Semantic memory for AI agents - local-first, MCP-native"
+            homepage "https://github.com/rendro/alecto"
+            version "$VERSION"
+
+            on_macos do
+              on_intel do
+                url "https://github.com/rendro/alecto/releases/download/v#{version}/alecto-x86_64-apple-darwin.tar.gz"
+                sha256 "$SHA_INTEL"
+              end
+              on_arm do
+                url "https://github.com/rendro/alecto/releases/download/v#{version}/alecto-aarch64-apple-darwin.tar.gz"
+                sha256 "$SHA_ARM"
+              end
+            end
+
+            on_linux do
+              on_intel do
+                url "https://github.com/rendro/alecto/releases/download/v#{version}/alecto-x86_64-unknown-linux-gnu.tar.gz"
+                sha256 "$SHA_LINUX"
+              end
+            end
+
+            def install
+              bin.install "alecto"
+            end
+
+            test do
+              assert_match "alecto", shell_output("#{bin}/alecto --help")
+            end
+          end
+          EOF
+
+          # Remove leading whitespace from formula
+          sed -i 's/^          //' homebrew-tap/Formula/alecto.rb
+
+      - name: Commit and push
+        run: |
+          cd homebrew-tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/alecto.rb
+          git commit -m "Update alecto to v${{ steps.version.outputs.version }}"
+          git push

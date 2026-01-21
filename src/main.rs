@@ -1,0 +1,391 @@
+//! Alecto MCP Server
+//!
+//! Semantic memory for AI agents - local-first, MCP-native.
+//! Run this binary to start the MCP server.
+
+use std::path::PathBuf;
+
+use anyhow::Result;
+use clap::{Parser, Subcommand};
+use tracing_subscriber::{EnvFilter, fmt};
+
+#[derive(Parser)]
+#[command(name = "alecto")]
+#[command(about = "Semantic memory for AI agents - local-first, MCP-native")]
+#[command(version)]
+struct Cli {
+    /// Database path (defaults to ~/.alecto/data)
+    #[arg(long, global = true, env = "ALECTO_DB")]
+    db: Option<PathBuf>,
+
+    /// Enable verbose output
+    #[arg(short, long, global = true)]
+    verbose: bool,
+
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Set up Claude Code integration - writes CLAUDE.md instructions
+    Init {
+        /// Write instructions to local project CLAUDE.md (non-interactive)
+        #[arg(long, conflicts_with = "global")]
+        local: bool,
+
+        /// Write instructions to global ~/.claude/CLAUDE.md (non-interactive)
+        #[arg(long, conflicts_with = "local")]
+        global: bool,
+    },
+
+    /// Show database statistics (item count, chunk count)
+    Stats,
+
+    /// List stored items for debugging
+    List {
+        /// Maximum number of items to show
+        #[arg(short, long, default_value = "20")]
+        limit: usize,
+    },
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    // Initialize logging to stderr (stdout is for MCP protocol)
+    // For CLI commands, only show logs if verbose is enabled
+    // For MCP server (no command), always show info logs
+    let filter = if cli.verbose {
+        EnvFilter::new("alecto=debug")
+    } else if cli.command.is_none() {
+        // MCP server mode - show info logs
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("alecto=info"))
+    } else {
+        // CLI command mode - suppress logs unless verbose
+        EnvFilter::new("alecto=warn")
+    };
+
+    fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .without_time()
+        .with_writer(std::io::stderr)
+        .init();
+
+    match cli.command {
+        None => run_mcp_server(cli.db),
+        Some(Commands::Init { local, global }) => run_init(local, global),
+        Some(Commands::Stats) => run_stats(cli.db),
+        Some(Commands::List { limit }) => run_list(cli.db, limit),
+    }
+}
+
+/// Run the MCP server (default behavior)
+fn run_mcp_server(db_override: Option<PathBuf>) -> Result<()> {
+    // Get database path
+    let db_path = db_override.unwrap_or_else(alecto::central_db_path);
+
+    // Auto-detect project context from current directory
+    let cwd = std::env::current_dir().ok();
+    let project_root = cwd.as_deref().and_then(alecto::find_project_root);
+    let project_id = project_root
+        .as_ref()
+        .and_then(|root| alecto::get_or_create_project_id(root).ok());
+
+    tracing::info!("Starting Alecto MCP server");
+    tracing::info!("Database: {:?}", db_path);
+
+    if let Some(ref root) = project_root {
+        tracing::info!("Project: {:?}", root);
+    }
+
+    if let Some(ref pid) = project_id {
+        tracing::info!("Project ID: {}", pid);
+    }
+
+    // Run MCP server
+    alecto::mcp::run(&db_path, project_id)?;
+
+    Ok(())
+}
+
+/// Check if a file contains Alecto instructions
+fn has_alecto_instructions(path: &PathBuf) -> bool {
+    if path.exists() {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            return content.contains("mcp__alecto__");
+        }
+    }
+    false
+}
+
+/// Initialize Claude Code integration
+fn run_init(use_local: bool, use_global: bool) -> Result<()> {
+    use dialoguer::{Confirm, Select};
+
+    let cwd = std::env::current_dir()?;
+
+    // Find or create project root
+    let project_root = alecto::find_project_root(&cwd).unwrap_or_else(|| cwd.clone());
+
+    println!("Initializing Alecto for: {}", project_root.display());
+
+    // Create .alecto directory and project ID
+    let alecto_dir = alecto::init_project(&project_root)?;
+    println!("Created: {}", alecto_dir.display());
+
+    // Determine CLAUDE.md paths
+    let local_claude_md = project_root.join("CLAUDE.md");
+    let global_claude_md = dirs::home_dir()
+        .map(|h| h.join(".claude").join("CLAUDE.md"))
+        .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
+
+    // Check if instructions already exist in either location
+    let local_has_instructions = has_alecto_instructions(&local_claude_md);
+    let global_has_instructions = has_alecto_instructions(&global_claude_md);
+
+    // If both already have instructions, we're done
+    if local_has_instructions && global_has_instructions {
+        println!("Alecto instructions already present in both local and global CLAUDE.md");
+        println!("\nAlecto initialized successfully!");
+        println!("The MCP server will now auto-detect this project.");
+        return Ok(());
+    }
+
+    // Determine target based on flags or interactive prompt
+    let claude_md_path = if use_local {
+        if local_has_instructions {
+            println!("Local CLAUDE.md already contains Alecto instructions");
+            println!("\nAlecto initialized successfully!");
+            println!("The MCP server will now auto-detect this project.");
+            return Ok(());
+        }
+        Some(local_claude_md)
+    } else if use_global {
+        if global_has_instructions {
+            println!("Global CLAUDE.md already contains Alecto instructions");
+            println!("\nAlecto initialized successfully!");
+            println!("The MCP server will now auto-detect this project.");
+            return Ok(());
+        }
+        Some(global_claude_md)
+    } else {
+        // Interactive mode - build options with status indicators
+        let local_status = if local_has_instructions {
+            " [already added]"
+        } else {
+            ""
+        };
+        let global_status = if global_has_instructions {
+            " [already added]"
+        } else {
+            ""
+        };
+
+        let options = &[
+            format!("Local  ({}){}", local_claude_md.display(), local_status),
+            format!("Global ({}){}", global_claude_md.display(), global_status),
+            "Skip".to_string(),
+        ];
+
+        // Default to the first option that doesn't already have instructions
+        let default_idx = if local_has_instructions { 1 } else { 0 };
+
+        let selection = Select::new()
+            .with_prompt("Where should Alecto instructions be added?")
+            .items(options)
+            .default(default_idx)
+            .interact()?;
+
+        match selection {
+            0 => {
+                if local_has_instructions {
+                    println!("Local CLAUDE.md already contains Alecto instructions");
+                    None
+                } else {
+                    Some(local_claude_md)
+                }
+            }
+            1 => {
+                if global_has_instructions {
+                    println!("Global CLAUDE.md already contains Alecto instructions");
+                    None
+                } else {
+                    Some(global_claude_md)
+                }
+            }
+            _ => None,
+        }
+    };
+
+    let Some(claude_md_path) = claude_md_path else {
+        println!("\nAlecto initialized successfully!");
+        println!("The MCP server will now auto-detect this project.");
+        return Ok(());
+    };
+
+    let instructions = generate_claude_md_instructions();
+
+    // Ensure parent directory exists for global path
+    if let Some(parent) = claude_md_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    if claude_md_path.exists() {
+        // Read existing content
+        let existing = std::fs::read_to_string(&claude_md_path)?;
+
+        // In non-interactive mode, always append; in interactive mode, ask
+        let should_append = if use_local || use_global {
+            true
+        } else {
+            Confirm::new()
+                .with_prompt("CLAUDE.md exists. Append Alecto instructions?")
+                .default(true)
+                .interact()?
+        };
+
+        if should_append {
+            let new_content = format!("{}\n\n{}", existing.trim(), instructions);
+            std::fs::write(&claude_md_path, new_content)?;
+            println!("Updated: {}", claude_md_path.display());
+        } else {
+            println!("Skipped CLAUDE.md update");
+        }
+    } else {
+        std::fs::write(&claude_md_path, &instructions)?;
+        println!("Created: {}", claude_md_path.display());
+    }
+
+    println!("\nAlecto initialized successfully!");
+    println!("The MCP server will now auto-detect this project.");
+
+    Ok(())
+}
+
+/// Show database statistics
+fn run_stats(db_override: Option<PathBuf>) -> Result<()> {
+    let db_path = db_override.unwrap_or_else(alecto::central_db_path);
+
+    println!("Database: {}", db_path.display());
+
+    if !db_path.exists() {
+        println!("\nDatabase does not exist yet.");
+        println!("It will be created when you first store an item.");
+        return Ok(());
+    }
+
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let db = alecto::Database::open(&db_path).await?;
+        let stats = db.stats().await?;
+
+        println!("\nStatistics:");
+        println!("  Items:  {}", stats.item_count);
+        println!("  Chunks: {}", stats.chunk_count);
+
+        Ok(())
+    })
+}
+
+/// List stored items
+fn run_list(db_override: Option<PathBuf>, limit: usize) -> Result<()> {
+    let db_path = db_override.unwrap_or_else(alecto::central_db_path);
+
+    if !db_path.exists() {
+        println!("Database does not exist yet.");
+        return Ok(());
+    }
+
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let mut db = alecto::Database::open(&db_path).await?;
+        let filters = alecto::ItemFilters::default();
+        let items = db
+            .list_items(filters, Some(limit), alecto::ListScope::All)
+            .await?;
+
+        if items.is_empty() {
+            println!("No items stored.");
+            return Ok(());
+        }
+
+        println!("Stored items ({}):\n", items.len());
+
+        for item in items {
+            let title = item.title.as_deref().unwrap_or("(untitled)");
+            let scope = if item.project_id.is_some() {
+                "project"
+            } else {
+                "global"
+            };
+            let tags = if item.tags.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", item.tags.join(", "))
+            };
+
+            println!("  {} ({}){}", title, scope, tags);
+            println!("    ID: {}", item.id);
+
+            // Show truncated content
+            let content_preview: String = item
+                .content
+                .chars()
+                .take(80)
+                .collect::<String>()
+                .replace('\n', " ");
+            let ellipsis = if item.content.len() > 80 { "..." } else { "" };
+            println!("    Content: {}{}", content_preview, ellipsis);
+            println!();
+        }
+
+        Ok(())
+    })
+}
+
+/// Generate CLAUDE.md instructions for Alecto
+fn generate_claude_md_instructions() -> String {
+    r#"# Alecto Memory System
+
+Use the Alecto MCP tools for persistent memory storage.
+
+## Tools (4 total)
+
+- `mcp__alecto__store` - Store content for later retrieval
+- `mcp__alecto__recall` - Search by semantic similarity
+- `mcp__alecto__list` - List stored items
+- `mcp__alecto__forget` - Delete an item by ID
+
+## When to Store
+
+- User preferences (e.g., "I prefer X over Y")
+- Project conventions and decisions
+- Important learnings about the codebase
+- Reference material, API docs, specifications
+
+## Usage Examples
+
+Store a preference:
+```json
+{"content": "User prefers dark mode", "tags": ["preference"]}
+```
+
+Store a document (auto-chunked if long):
+```json
+{"content": "<long content>", "title": "API Reference", "tags": ["docs"]}
+```
+
+Search:
+```json
+{"query": "user preferences"}
+```
+
+## Scopes
+
+- `project` - Items specific to this project (default)
+- `global` - Items shared across all projects
+"#
+    .to_string()
+}

@@ -1,0 +1,232 @@
+//! Alecto: Semantic memory for AI agents
+//!
+//! A local-first, MCP-native vector database for AI agent memory.
+//!
+//! ## Features
+//!
+//! - **Embedded storage** - LanceDB-powered, directory-based, no server required
+//! - **Local embeddings** - Uses `all-MiniLM-L6-v2` locally, no API keys needed
+//! - **MCP-native** - 4 tools for seamless LLM integration
+//! - **Project-aware** - Scoped memories with automatic project detection
+//! - **Auto-chunking** - Long content is automatically chunked for better search
+
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+use uuid::Uuid;
+
+pub mod chunker;
+pub mod db;
+pub mod document;
+pub mod embedder;
+pub mod error;
+pub mod item;
+pub mod mcp;
+pub mod retry;
+
+pub use chunker::{ChunkResult, ChunkingConfig, chunk_content};
+pub use db::Database;
+pub use document::ContentType;
+pub use embedder::{EMBEDDING_DIM, Embedder};
+pub use error::{AlectoError, Result};
+pub use item::{Chunk, ConflictInfo, Item, ItemFilters, SearchResult, StoreResult};
+pub use retry::{RetryConfig, with_retry};
+
+/// Scope for storing items
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StoreScope {
+    /// Store in project-local scope (with project_id)
+    #[default]
+    Project,
+    /// Store in global scope (no project_id)
+    Global,
+}
+
+impl std::str::FromStr for StoreScope {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "project" => Ok(StoreScope::Project),
+            "global" => Ok(StoreScope::Global),
+            _ => Err(format!(
+                "Invalid store scope: {}. Use 'project' or 'global'",
+                s
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for StoreScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StoreScope::Project => write!(f, "project"),
+            StoreScope::Global => write!(f, "global"),
+        }
+    }
+}
+
+/// Scope for listing items (recall always searches all with boosting)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ListScope {
+    /// List only project-local items
+    Project,
+    /// List only global items
+    Global,
+    /// List all items
+    #[default]
+    All,
+}
+
+impl std::str::FromStr for ListScope {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "project" => Ok(ListScope::Project),
+            "global" => Ok(ListScope::Global),
+            "all" => Ok(ListScope::All),
+            _ => Err(format!(
+                "Invalid list scope: {}. Use 'project', 'global', or 'all'",
+                s
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for ListScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ListScope::Project => write!(f, "project"),
+            ListScope::Global => write!(f, "global"),
+            ListScope::All => write!(f, "all"),
+        }
+    }
+}
+
+/// Get the central database path.
+///
+/// Returns `~/.alecto/data` or the path specified in `ALECTO_DB` environment variable.
+/// Note: LanceDB uses a directory, not a single file.
+pub fn central_db_path() -> PathBuf {
+    if let Ok(path) = std::env::var("ALECTO_DB") {
+        return PathBuf::from(path);
+    }
+
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".alecto")
+        .join("data")
+}
+
+/// Get the default global database path (alias for central_db_path for backwards compatibility)
+pub fn default_db_path() -> PathBuf {
+    central_db_path()
+}
+
+/// Project configuration stored in `.alecto/config`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectConfig {
+    /// Unique project identifier (UUID)
+    pub project_id: String,
+}
+
+impl Default for ProjectConfig {
+    fn default() -> Self {
+        Self {
+            project_id: Uuid::new_v4().to_string(),
+        }
+    }
+}
+
+/// Get or create the project ID for a given project root.
+///
+/// The project ID is stored in `<project_root>/.alecto/config`.
+/// If no config exists, a new UUID is generated and saved.
+pub fn get_or_create_project_id(project_root: &Path) -> std::io::Result<String> {
+    let config_path = project_root.join(".alecto").join("config");
+
+    // Try to read existing config
+    if config_path.exists() {
+        let content = std::fs::read_to_string(&config_path)?;
+        if let Ok(config) = serde_json::from_str::<ProjectConfig>(&content) {
+            return Ok(config.project_id);
+        }
+    }
+
+    // Create new config with generated UUID
+    let config = ProjectConfig::default();
+
+    // Ensure .alecto directory exists
+    let alecto_dir = project_root.join(".alecto");
+    std::fs::create_dir_all(&alecto_dir)?;
+
+    // Save config
+    let content = serde_json::to_string_pretty(&config)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    std::fs::write(&config_path, content)?;
+
+    Ok(config.project_id)
+}
+
+/// Apply similarity boosting based on project context.
+///
+/// - Same project: 1.15x boost (capped at 1.0)
+/// - Different project: 0.95x penalty
+/// - Global or no context: no change
+pub fn boost_similarity(
+    base: f32,
+    mem_project: Option<&str>,
+    current_project: Option<&str>,
+) -> f32 {
+    match (mem_project, current_project) {
+        (Some(m), Some(c)) if m == c => (base * 1.15).min(1.0), // Same project: boost
+        (Some(_), Some(_)) => base * 0.95,                      // Different project: slight penalty
+        _ => base,                                              // Global or no context
+    }
+}
+
+/// Find the project root by walking up from the given path.
+///
+/// Looks for directories containing `.alecto/` or `.git/` markers.
+/// Returns `None` if no project root is found.
+pub fn find_project_root(start: &Path) -> Option<PathBuf> {
+    let mut current = start.to_path_buf();
+
+    // If start is a file, use its parent directory
+    if current.is_file() {
+        current = current.parent()?.to_path_buf();
+    }
+
+    loop {
+        // Check for .alecto directory first (explicit project marker)
+        if current.join(".alecto").is_dir() {
+            return Some(current);
+        }
+
+        // Check for .git directory as fallback
+        if current.join(".git").exists() {
+            return Some(current);
+        }
+
+        // Move to parent directory
+        match current.parent() {
+            Some(parent) => current = parent.to_path_buf(),
+            None => return None,
+        }
+    }
+}
+
+/// Initialize a project directory for Alecto.
+///
+/// Creates the `.alecto/` directory in the specified path and generates a project ID.
+pub fn init_project(project_root: &Path) -> std::io::Result<PathBuf> {
+    let alecto_dir = project_root.join(".alecto");
+    std::fs::create_dir_all(&alecto_dir)?;
+
+    // Generate project ID
+    get_or_create_project_id(project_root)?;
+
+    Ok(alecto_dir)
+}
