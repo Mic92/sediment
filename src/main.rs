@@ -1,4 +1,4 @@
-//! Alecto MCP Server
+//! Sediment MCP Server
 //!
 //! Semantic memory for AI agents - local-first, MCP-native.
 //! Run this binary to start the MCP server.
@@ -10,12 +10,12 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::{EnvFilter, fmt};
 
 #[derive(Parser)]
-#[command(name = "alecto")]
+#[command(name = "sediment")]
 #[command(about = "Semantic memory for AI agents - local-first, MCP-native")]
 #[command(version)]
 struct Cli {
-    /// Database path (defaults to ~/.alecto/data)
-    #[arg(long, global = true, env = "ALECTO_DB")]
+    /// Database path (defaults to ~/.sediment/data)
+    #[arg(long, global = true, env = "SEDIMENT_DB")]
     db: Option<PathBuf>,
 
     /// Enable verbose output
@@ -57,13 +57,13 @@ fn main() -> Result<()> {
     // For CLI commands, only show logs if verbose is enabled
     // For MCP server (no command), always show info logs
     let filter = if cli.verbose {
-        EnvFilter::new("alecto=debug")
+        EnvFilter::new("sediment=debug")
     } else if cli.command.is_none() {
         // MCP server mode - show info logs
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("alecto=info"))
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("sediment=info"))
     } else {
         // CLI command mode - suppress logs unless verbose
-        EnvFilter::new("alecto=warn")
+        EnvFilter::new("sediment=warn")
     };
 
     fmt()
@@ -84,16 +84,16 @@ fn main() -> Result<()> {
 /// Run the MCP server (default behavior)
 fn run_mcp_server(db_override: Option<PathBuf>) -> Result<()> {
     // Get database path
-    let db_path = db_override.unwrap_or_else(alecto::central_db_path);
+    let db_path = db_override.unwrap_or_else(sediment::central_db_path);
 
     // Auto-detect project context from current directory
     let cwd = std::env::current_dir().ok();
-    let project_root = cwd.as_deref().and_then(alecto::find_project_root);
+    let project_root = cwd.as_deref().and_then(sediment::find_project_root);
     let project_id = project_root
         .as_ref()
-        .and_then(|root| alecto::get_or_create_project_id(root).ok());
+        .and_then(|root| sediment::get_or_create_project_id(root).ok());
 
-    tracing::info!("Starting Alecto MCP server");
+    tracing::info!("Starting Sediment MCP server");
     tracing::info!("Database: {:?}", db_path);
 
     if let Some(ref root) = project_root {
@@ -105,16 +105,16 @@ fn run_mcp_server(db_override: Option<PathBuf>) -> Result<()> {
     }
 
     // Run MCP server
-    alecto::mcp::run(&db_path, project_id)?;
+    sediment::mcp::run(&db_path, project_id)?;
 
     Ok(())
 }
 
-/// Check if a file contains Alecto instructions
-fn has_alecto_instructions(path: &PathBuf) -> bool {
+/// Check if a file contains Sediment instructions
+fn has_sediment_instructions(path: &PathBuf) -> bool {
     if path.exists() {
         if let Ok(content) = std::fs::read_to_string(path) {
-            return content.contains("mcp__alecto__");
+            return content.contains("mcp__sediment__");
         }
     }
     false
@@ -127,13 +127,13 @@ fn run_init(use_local: bool, use_global: bool) -> Result<()> {
     let cwd = std::env::current_dir()?;
 
     // Find or create project root
-    let project_root = alecto::find_project_root(&cwd).unwrap_or_else(|| cwd.clone());
+    let project_root = sediment::find_project_root(&cwd).unwrap_or_else(|| cwd.clone());
 
-    println!("Initializing Alecto for: {}", project_root.display());
+    println!("Initializing Sediment for: {}", project_root.display());
 
-    // Create .alecto directory and project ID
-    let alecto_dir = alecto::init_project(&project_root)?;
-    println!("Created: {}", alecto_dir.display());
+    // Create .sediment directory and project ID
+    let sediment_dir = sediment::init_project(&project_root)?;
+    println!("Created: {}", sediment_dir.display());
 
     // Determine CLAUDE.md paths
     let local_claude_md = project_root.join("CLAUDE.md");
@@ -142,13 +142,13 @@ fn run_init(use_local: bool, use_global: bool) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
 
     // Check if instructions already exist in either location
-    let local_has_instructions = has_alecto_instructions(&local_claude_md);
-    let global_has_instructions = has_alecto_instructions(&global_claude_md);
+    let local_has_instructions = has_sediment_instructions(&local_claude_md);
+    let global_has_instructions = has_sediment_instructions(&global_claude_md);
 
     // If both already have instructions, we're done
     if local_has_instructions && global_has_instructions {
-        println!("Alecto instructions already present in both local and global CLAUDE.md");
-        println!("\nAlecto initialized successfully!");
+        println!("Sediment instructions already present in both local and global CLAUDE.md");
+        println!("\nSediment initialized successfully!");
         println!("The MCP server will now auto-detect this project.");
         return Ok(());
     }
@@ -156,16 +156,16 @@ fn run_init(use_local: bool, use_global: bool) -> Result<()> {
     // Determine target based on flags or interactive prompt
     let claude_md_path = if use_local {
         if local_has_instructions {
-            println!("Local CLAUDE.md already contains Alecto instructions");
-            println!("\nAlecto initialized successfully!");
+            println!("Local CLAUDE.md already contains Sediment instructions");
+            println!("\nSediment initialized successfully!");
             println!("The MCP server will now auto-detect this project.");
             return Ok(());
         }
         Some(local_claude_md)
     } else if use_global {
         if global_has_instructions {
-            println!("Global CLAUDE.md already contains Alecto instructions");
-            println!("\nAlecto initialized successfully!");
+            println!("Global CLAUDE.md already contains Sediment instructions");
+            println!("\nSediment initialized successfully!");
             println!("The MCP server will now auto-detect this project.");
             return Ok(());
         }
@@ -193,7 +193,7 @@ fn run_init(use_local: bool, use_global: bool) -> Result<()> {
         let default_idx = if local_has_instructions { 1 } else { 0 };
 
         let selection = Select::new()
-            .with_prompt("Where should Alecto instructions be added?")
+            .with_prompt("Where should Sediment instructions be added?")
             .items(options)
             .default(default_idx)
             .interact()?;
@@ -201,7 +201,7 @@ fn run_init(use_local: bool, use_global: bool) -> Result<()> {
         match selection {
             0 => {
                 if local_has_instructions {
-                    println!("Local CLAUDE.md already contains Alecto instructions");
+                    println!("Local CLAUDE.md already contains Sediment instructions");
                     None
                 } else {
                     Some(local_claude_md)
@@ -209,7 +209,7 @@ fn run_init(use_local: bool, use_global: bool) -> Result<()> {
             }
             1 => {
                 if global_has_instructions {
-                    println!("Global CLAUDE.md already contains Alecto instructions");
+                    println!("Global CLAUDE.md already contains Sediment instructions");
                     None
                 } else {
                     Some(global_claude_md)
@@ -220,7 +220,7 @@ fn run_init(use_local: bool, use_global: bool) -> Result<()> {
     };
 
     let Some(claude_md_path) = claude_md_path else {
-        println!("\nAlecto initialized successfully!");
+        println!("\nSediment initialized successfully!");
         println!("The MCP server will now auto-detect this project.");
         return Ok(());
     };
@@ -241,7 +241,7 @@ fn run_init(use_local: bool, use_global: bool) -> Result<()> {
             true
         } else {
             Confirm::new()
-                .with_prompt("CLAUDE.md exists. Append Alecto instructions?")
+                .with_prompt("CLAUDE.md exists. Append Sediment instructions?")
                 .default(true)
                 .interact()?
         };
@@ -258,7 +258,7 @@ fn run_init(use_local: bool, use_global: bool) -> Result<()> {
         println!("Created: {}", claude_md_path.display());
     }
 
-    println!("\nAlecto initialized successfully!");
+    println!("\nSediment initialized successfully!");
     println!("The MCP server will now auto-detect this project.");
 
     Ok(())
@@ -266,7 +266,7 @@ fn run_init(use_local: bool, use_global: bool) -> Result<()> {
 
 /// Show database statistics
 fn run_stats(db_override: Option<PathBuf>) -> Result<()> {
-    let db_path = db_override.unwrap_or_else(alecto::central_db_path);
+    let db_path = db_override.unwrap_or_else(sediment::central_db_path);
 
     println!("Database: {}", db_path.display());
 
@@ -278,7 +278,7 @@ fn run_stats(db_override: Option<PathBuf>) -> Result<()> {
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
-        let db = alecto::Database::open(&db_path).await?;
+        let db = sediment::Database::open(&db_path).await?;
         let stats = db.stats().await?;
 
         println!("\nStatistics:");
@@ -291,7 +291,7 @@ fn run_stats(db_override: Option<PathBuf>) -> Result<()> {
 
 /// List stored items
 fn run_list(db_override: Option<PathBuf>, limit: usize) -> Result<()> {
-    let db_path = db_override.unwrap_or_else(alecto::central_db_path);
+    let db_path = db_override.unwrap_or_else(sediment::central_db_path);
 
     if !db_path.exists() {
         println!("Database does not exist yet.");
@@ -300,10 +300,10 @@ fn run_list(db_override: Option<PathBuf>, limit: usize) -> Result<()> {
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
-        let mut db = alecto::Database::open(&db_path).await?;
-        let filters = alecto::ItemFilters::default();
+        let mut db = sediment::Database::open(&db_path).await?;
+        let filters = sediment::ItemFilters::default();
         let items = db
-            .list_items(filters, Some(limit), alecto::ListScope::All)
+            .list_items(filters, Some(limit), sediment::ListScope::All)
             .await?;
 
         if items.is_empty() {
@@ -345,18 +345,18 @@ fn run_list(db_override: Option<PathBuf>, limit: usize) -> Result<()> {
     })
 }
 
-/// Generate CLAUDE.md instructions for Alecto
+/// Generate CLAUDE.md instructions for Sediment
 fn generate_claude_md_instructions() -> String {
-    r#"# Alecto Memory System
+    r#"# Sediment Memory System
 
-Use the Alecto MCP tools for persistent memory storage.
+Use the Sediment MCP tools for persistent memory storage.
 
 ## Tools (4 total)
 
-- `mcp__alecto__store` - Store content for later retrieval
-- `mcp__alecto__recall` - Search by semantic similarity
-- `mcp__alecto__list` - List stored items
-- `mcp__alecto__forget` - Delete an item by ID
+- `mcp__sediment__store` - Store content for later retrieval
+- `mcp__sediment__recall` - Search by semantic similarity
+- `mcp__sediment__list` - List stored items
+- `mcp__sediment__forget` - Delete an item by ID
 
 ## When to Store
 

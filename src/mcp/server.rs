@@ -135,7 +135,7 @@ fn handle_initialize(id: Option<Value>) -> Response {
             },
         },
         server_info: ServerInfo {
-            name: "alecto".to_string(),
+            name: "sediment".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
         },
     };

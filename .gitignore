@@ -12,8 +12,8 @@ Cargo.lock
 .DS_Store
 Thumbs.db
 
-# Alecto local data
-.alecto/
+# Sediment local data
+.sediment/
 
 # Cloned repos (for local testing)
 homebrew-tap/

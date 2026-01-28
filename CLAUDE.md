@@ -29,7 +29,7 @@ cargo install --path .
 
 ## Architecture
 
-Alecto is a semantic memory system for AI agents, running as an MCP (Model Context Protocol) server.
+Sediment is a semantic memory system for AI agents, running as an MCP (Model Context Protocol) server.
 
 ### Core Components
 
@@ -54,8 +54,8 @@ Alecto is a semantic memory system for AI agents, running as an MCP (Model Conte
 
 ### Key Design Decisions
 
-- **Single central database** at `~/.alecto/data/` stores all projects
-- **Project scoping** via UUID stored in `.alecto/config` per project
+- **Single central database** at `~/.sediment/data/` stores all projects
+- **Project scoping** via UUID stored in `.sediment/config` per project
 - **Similarity boosting**: Same-project items get 1.15x boost, different projects 0.95x penalty
 - **Conflict detection**: Items with >=0.85 similarity flagged on store
 - **Fresh DB connection per tool call** with shared embedder for efficiency

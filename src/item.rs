@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// A unified item stored in Alecto
+/// A unified item stored in Sediment
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Item {
     /// Unique identifier (UUID)

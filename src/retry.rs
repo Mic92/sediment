@@ -75,7 +75,7 @@ impl RetryConfig {
 /// # Example
 ///
 /// ```ignore
-/// use alecto::retry::{with_retry, RetryConfig};
+/// use sediment::retry::{with_retry, RetryConfig};
 ///
 /// let result = with_retry(&RetryConfig::default(), || async {
 ///     // Your fallible async operation here

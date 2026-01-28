@@ -1,4 +1,4 @@
-//! MCP Tool definitions for Alecto
+//! MCP Tool definitions for Sediment
 //!
 //! Simplified unified API with 4 tools: store, recall, list, forget
 

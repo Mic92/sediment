@@ -21,7 +21,7 @@ use tracing::{debug, info};
 use crate::chunker::{ChunkingConfig, chunk_content};
 use crate::document::ContentType;
 use crate::embedder::{EMBEDDING_DIM, Embedder};
-use crate::error::{AlectoError, Result};
+use crate::error::{Result, SedimentError};
 use crate::item::{Chunk, ConflictInfo, Item, ItemFilters, SearchResult, StoreResult};
 
 /// Threshold for auto-chunking (in characters)
@@ -128,14 +128,16 @@ impl Database {
         // Ensure parent directory exists
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
-                AlectoError::Database(format!("Failed to create database directory: {}", e))
+                SedimentError::Database(format!("Failed to create database directory: {}", e))
             })?;
         }
 
         let db = connect(path.to_str().unwrap())
             .execute()
             .await
-            .map_err(|e| AlectoError::Database(format!("Failed to connect to database: {}", e)))?;
+            .map_err(|e| {
+                SedimentError::Database(format!("Failed to connect to database: {}", e))
+            })?;
 
         let mut database = Self {
             db,
@@ -168,26 +170,22 @@ impl Database {
             .table_names()
             .execute()
             .await
-            .map_err(|e| AlectoError::Database(format!("Failed to list tables: {}", e)))?;
+            .map_err(|e| SedimentError::Database(format!("Failed to list tables: {}", e)))?;
 
         // Items table
         if table_names.contains(&"items".to_string()) {
             self.items_table =
-                Some(
-                    self.db.open_table("items").execute().await.map_err(|e| {
-                        AlectoError::Database(format!("Failed to open items: {}", e))
-                    })?,
-                );
+                Some(self.db.open_table("items").execute().await.map_err(|e| {
+                    SedimentError::Database(format!("Failed to open items: {}", e))
+                })?);
         }
 
         // Chunks table
         if table_names.contains(&"chunks".to_string()) {
             self.chunks_table =
-                Some(
-                    self.db.open_table("chunks").execute().await.map_err(|e| {
-                        AlectoError::Database(format!("Failed to open chunks: {}", e))
-                    })?,
-                );
+                Some(self.db.open_table("chunks").execute().await.map_err(|e| {
+                    SedimentError::Database(format!("Failed to open chunks: {}", e))
+                })?);
         }
 
         Ok(())
@@ -203,7 +201,7 @@ impl Database {
                 .execute()
                 .await
                 .map_err(|e| {
-                    AlectoError::Database(format!("Failed to create items table: {}", e))
+                    SedimentError::Database(format!("Failed to create items table: {}", e))
                 })?;
             self.items_table = Some(table);
         }
@@ -220,7 +218,7 @@ impl Database {
                 .execute()
                 .await
                 .map_err(|e| {
-                    AlectoError::Database(format!("Failed to create chunks table: {}", e))
+                    SedimentError::Database(format!("Failed to create chunks table: {}", e))
                 })?;
             self.chunks_table = Some(table);
         }
@@ -267,7 +265,7 @@ impl Database {
             .add(Box::new(batches))
             .execute()
             .await
-            .map_err(|e| AlectoError::Database(format!("Failed to store item: {}", e)))?;
+            .map_err(|e| SedimentError::Database(format!("Failed to store item: {}", e)))?;
 
         // If chunking is needed, create and store chunks
         if should_chunk {
@@ -297,7 +295,9 @@ impl Database {
                     .add(Box::new(batches))
                     .execute()
                     .await
-                    .map_err(|e| AlectoError::Database(format!("Failed to store chunk: {}", e)))?;
+                    .map_err(|e| {
+                        SedimentError::Database(format!("Failed to store chunk: {}", e))
+                    })?;
             }
 
             debug!(
@@ -341,7 +341,7 @@ impl Database {
 
             let mut query_builder = table
                 .vector_search(query_embedding.clone())
-                .map_err(|e| AlectoError::Database(format!("Failed to build search: {}", e)))?
+                .map_err(|e| SedimentError::Database(format!("Failed to build search: {}", e)))?
                 .limit(limit * 2);
 
             if !filter_parts.is_empty() {
@@ -352,10 +352,12 @@ impl Database {
             let results = query_builder
                 .execute()
                 .await
-                .map_err(|e| AlectoError::Database(format!("Search failed: {}", e)))?
+                .map_err(|e| SedimentError::Database(format!("Search failed: {}", e)))?
                 .try_collect::<Vec<_>>()
                 .await
-                .map_err(|e| AlectoError::Database(format!("Failed to collect results: {}", e)))?;
+                .map_err(|e| {
+                    SedimentError::Database(format!("Failed to collect results: {}", e))
+                })?;
 
             for batch in results {
                 let items = batch_to_items(&batch)?;
@@ -397,15 +399,17 @@ impl Database {
         if let Some(chunks_table) = &self.chunks_table {
             let chunk_results = chunks_table
                 .vector_search(query_embedding)
-                .map_err(|e| AlectoError::Database(format!("Failed to build chunk search: {}", e)))?
+                .map_err(|e| {
+                    SedimentError::Database(format!("Failed to build chunk search: {}", e))
+                })?
                 .limit(limit * 3)
                 .execute()
                 .await
-                .map_err(|e| AlectoError::Database(format!("Chunk search failed: {}", e)))?
+                .map_err(|e| SedimentError::Database(format!("Chunk search failed: {}", e)))?
                 .try_collect::<Vec<_>>()
                 .await
                 .map_err(|e| {
-                    AlectoError::Database(format!("Failed to collect chunk results: {}", e))
+                    SedimentError::Database(format!("Failed to collect chunk results: {}", e))
                 })?;
 
             // Group chunks by item and find best chunk for each item
@@ -506,15 +510,15 @@ impl Database {
 
         let results = table
             .vector_search(embedding)
-            .map_err(|e| AlectoError::Database(format!("Failed to build search: {}", e)))?
+            .map_err(|e| SedimentError::Database(format!("Failed to build search: {}", e)))?
             .limit(limit)
             .only_if(filter)
             .execute()
             .await
-            .map_err(|e| AlectoError::Database(format!("Search failed: {}", e)))?
+            .map_err(|e| SedimentError::Database(format!("Search failed: {}", e)))?
             .try_collect::<Vec<_>>()
             .await
-            .map_err(|e| AlectoError::Database(format!("Failed to collect results: {}", e)))?;
+            .map_err(|e| SedimentError::Database(format!("Failed to collect results: {}", e)))?;
 
         let mut conflicts = Vec::new();
 
@@ -592,10 +596,10 @@ impl Database {
         let results = query
             .execute()
             .await
-            .map_err(|e| AlectoError::Database(format!("Query failed: {}", e)))?
+            .map_err(|e| SedimentError::Database(format!("Query failed: {}", e)))?
             .try_collect::<Vec<_>>()
             .await
-            .map_err(|e| AlectoError::Database(format!("Failed to collect: {}", e)))?;
+            .map_err(|e| SedimentError::Database(format!("Failed to collect: {}", e)))?;
 
         let mut items = Vec::new();
         for batch in results {
@@ -623,10 +627,10 @@ impl Database {
             .limit(1)
             .execute()
             .await
-            .map_err(|e| AlectoError::Database(format!("Query failed: {}", e)))?
+            .map_err(|e| SedimentError::Database(format!("Query failed: {}", e)))?
             .try_collect::<Vec<_>>()
             .await
-            .map_err(|e| AlectoError::Database(format!("Failed to collect: {}", e)))?;
+            .map_err(|e| SedimentError::Database(format!("Failed to collect: {}", e)))?;
 
         for batch in results {
             let items = batch_to_items(&batch)?;
@@ -645,7 +649,7 @@ impl Database {
             chunks_table
                 .delete(&format!("item_id = '{}'", id))
                 .await
-                .map_err(|e| AlectoError::Database(format!("Delete chunks failed: {}", e)))?;
+                .map_err(|e| SedimentError::Database(format!("Delete chunks failed: {}", e)))?;
         }
 
         // Delete item
@@ -657,7 +661,7 @@ impl Database {
         table
             .delete(&format!("id = '{}'", id))
             .await
-            .map_err(|e| AlectoError::Database(format!("Delete failed: {}", e)))?;
+            .map_err(|e| SedimentError::Database(format!("Delete failed: {}", e)))?;
 
         Ok(true)
     }
@@ -670,14 +674,14 @@ impl Database {
             stats.item_count = table
                 .count_rows(None)
                 .await
-                .map_err(|e| AlectoError::Database(format!("Count failed: {}", e)))?;
+                .map_err(|e| SedimentError::Database(format!("Count failed: {}", e)))?;
         }
 
         if let Some(table) = &self.chunks_table {
             stats.chunk_count = table
                 .count_rows(None)
                 .await
-                .map_err(|e| AlectoError::Database(format!("Count failed: {}", e)))?;
+                .map_err(|e| SedimentError::Database(format!("Count failed: {}", e)))?;
         }
 
         Ok(stats)
@@ -783,7 +787,7 @@ fn item_to_batch(item: &Item) -> Result<RecordBatch> {
             Arc::new(vector),
         ],
     )
-    .map_err(|e| AlectoError::Database(format!("Failed to create batch: {}", e)))
+    .map_err(|e| SedimentError::Database(format!("Failed to create batch: {}", e)))
 }
 
 fn batch_to_items(batch: &RecordBatch) -> Result<Vec<Item>> {
@@ -792,12 +796,12 @@ fn batch_to_items(batch: &RecordBatch) -> Result<Vec<Item>> {
     let id_col = batch
         .column_by_name("id")
         .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-        .ok_or_else(|| AlectoError::Database("Missing id column".to_string()))?;
+        .ok_or_else(|| SedimentError::Database("Missing id column".to_string()))?;
 
     let content_col = batch
         .column_by_name("content")
         .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-        .ok_or_else(|| AlectoError::Database("Missing content column".to_string()))?;
+        .ok_or_else(|| SedimentError::Database("Missing content column".to_string()))?;
 
     let title_col = batch
         .column_by_name("title")
@@ -933,7 +937,7 @@ fn chunk_to_batch(chunk: &Chunk) -> Result<RecordBatch> {
             Arc::new(vector),
         ],
     )
-    .map_err(|e| AlectoError::Database(format!("Failed to create batch: {}", e)))
+    .map_err(|e| SedimentError::Database(format!("Failed to create batch: {}", e)))
 }
 
 fn batch_to_chunks(batch: &RecordBatch) -> Result<Vec<Chunk>> {
@@ -942,22 +946,22 @@ fn batch_to_chunks(batch: &RecordBatch) -> Result<Vec<Chunk>> {
     let id_col = batch
         .column_by_name("id")
         .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-        .ok_or_else(|| AlectoError::Database("Missing id column".to_string()))?;
+        .ok_or_else(|| SedimentError::Database("Missing id column".to_string()))?;
 
     let item_id_col = batch
         .column_by_name("item_id")
         .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-        .ok_or_else(|| AlectoError::Database("Missing item_id column".to_string()))?;
+        .ok_or_else(|| SedimentError::Database("Missing item_id column".to_string()))?;
 
     let chunk_index_col = batch
         .column_by_name("chunk_index")
         .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
-        .ok_or_else(|| AlectoError::Database("Missing chunk_index column".to_string()))?;
+        .ok_or_else(|| SedimentError::Database("Missing chunk_index column".to_string()))?;
 
     let content_col = batch
         .column_by_name("content")
         .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-        .ok_or_else(|| AlectoError::Database("Missing content column".to_string()))?;
+        .ok_or_else(|| SedimentError::Database("Missing content column".to_string()))?;
 
     let context_col = batch
         .column_by_name("context")
@@ -996,5 +1000,5 @@ fn create_embedding_array(embedding: &[f32]) -> Result<FixedSizeListArray> {
     let field = Arc::new(Field::new("item", DataType::Float32, true));
 
     FixedSizeListArray::try_new(field, EMBEDDING_DIM as i32, Arc::new(values), None)
-        .map_err(|e| AlectoError::Database(format!("Failed to create vector: {}", e)))
+        .map_err(|e| SedimentError::Database(format!("Failed to create vector: {}", e)))
 }

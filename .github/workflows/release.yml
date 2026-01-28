@@ -15,13 +15,13 @@ jobs:
         include:
           - target: x86_64-apple-darwin
             os: macos-13
-            name: alecto-x86_64-apple-darwin
+            name: sediment-x86_64-apple-darwin
           - target: aarch64-apple-darwin
             os: macos-14
-            name: alecto-aarch64-apple-darwin
+            name: sediment-aarch64-apple-darwin
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            name: alecto-x86_64-unknown-linux-gnu
+            name: sediment-x86_64-unknown-linux-gnu
 
     runs-on: ${{ matrix.os }}
 
@@ -39,9 +39,9 @@ jobs:
       - name: Package
         run: |
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/alecto dist/
+          cp target/${{ matrix.target }}/release/sediment dist/
           cd dist
-          tar -czvf ../${{ matrix.name }}.tar.gz alecto
+          tar -czvf ../${{ matrix.name }}.tar.gz sediment
           cd ..
           shasum -a 256 ${{ matrix.name }}.tar.gz > ${{ matrix.name }}.tar.gz.sha256
 
@@ -81,52 +81,52 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          SHA_INTEL=$(cat alecto-x86_64-apple-darwin.tar.gz.sha256 | awk '{print $1}')
-          SHA_ARM=$(cat alecto-aarch64-apple-darwin.tar.gz.sha256 | awk '{print $1}')
-          SHA_LINUX=$(cat alecto-x86_64-unknown-linux-gnu.tar.gz.sha256 | awk '{print $1}')
+          SHA_INTEL=$(cat sediment-x86_64-apple-darwin.tar.gz.sha256 | awk '{print $1}')
+          SHA_ARM=$(cat sediment-aarch64-apple-darwin.tar.gz.sha256 | awk '{print $1}')
+          SHA_LINUX=$(cat sediment-x86_64-unknown-linux-gnu.tar.gz.sha256 | awk '{print $1}')
 
-          cat > homebrew-tap/Formula/alecto.rb <<EOF
-          class Alecto < Formula
+          cat > homebrew-tap/Formula/sediment.rb <<EOF
+          class Sediment < Formula
             desc "Semantic memory for AI agents - local-first, MCP-native"
-            homepage "https://github.com/rendro/alecto"
+            homepage "https://github.com/rendro/sediment"
             version "$VERSION"
 
             on_macos do
               on_intel do
-                url "https://github.com/rendro/alecto/releases/download/v#{version}/alecto-x86_64-apple-darwin.tar.gz"
+                url "https://github.com/rendro/sediment/releases/download/v#{version}/sediment-x86_64-apple-darwin.tar.gz"
                 sha256 "$SHA_INTEL"
               end
               on_arm do
-                url "https://github.com/rendro/alecto/releases/download/v#{version}/alecto-aarch64-apple-darwin.tar.gz"
+                url "https://github.com/rendro/sediment/releases/download/v#{version}/sediment-aarch64-apple-darwin.tar.gz"
                 sha256 "$SHA_ARM"
               end
             end
 
             on_linux do
               on_intel do
-                url "https://github.com/rendro/alecto/releases/download/v#{version}/alecto-x86_64-unknown-linux-gnu.tar.gz"
+                url "https://github.com/rendro/sediment/releases/download/v#{version}/sediment-x86_64-unknown-linux-gnu.tar.gz"
                 sha256 "$SHA_LINUX"
               end
             end
 
             def install
-              bin.install "alecto"
+              bin.install "sediment"
             end
 
             test do
-              assert_match "alecto", shell_output("#{bin}/alecto --help")
+              assert_match "sediment", shell_output("#{bin}/sediment --help")
             end
           end
           EOF
 
           # Remove leading whitespace from formula
-          sed -i 's/^          //' homebrew-tap/Formula/alecto.rb
+          sed -i 's/^          //' homebrew-tap/Formula/sediment.rb
 
       - name: Commit and push
         run: |
           cd homebrew-tap
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Formula/alecto.rb
-          git commit -m "Update alecto to v${{ steps.version.outputs.version }}"
+          git add Formula/sediment.rb
+          git commit -m "Update sediment to v${{ steps.version.outputs.version }}"
           git push

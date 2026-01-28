@@ -7,7 +7,7 @@ use hf_hub::{Repo, RepoType, api::sync::ApiBuilder};
 use tokenizers::{PaddingParams, Tokenizer, TruncationParams};
 use tracing::info;
 
-use crate::error::{AlectoError, Result};
+use crate::error::{Result, SedimentError};
 
 /// Default model to use for embeddings
 pub const DEFAULT_MODEL_ID: &str = "sentence-transformers/all-MiniLM-L6-v2";
@@ -38,13 +38,13 @@ impl Embedder {
 
         // Load config
         let config_str = std::fs::read_to_string(&config_path)
-            .map_err(|e| AlectoError::ModelLoading(format!("Failed to read config: {}", e)))?;
+            .map_err(|e| SedimentError::ModelLoading(format!("Failed to read config: {}", e)))?;
         let config: Config = serde_json::from_str(&config_str)
-            .map_err(|e| AlectoError::ModelLoading(format!("Failed to parse config: {}", e)))?;
+            .map_err(|e| SedimentError::ModelLoading(format!("Failed to parse config: {}", e)))?;
 
         // Load tokenizer
         let mut tokenizer = Tokenizer::from_file(&tokenizer_path)
-            .map_err(|e| AlectoError::Tokenizer(format!("Failed to load tokenizer: {}", e)))?;
+            .map_err(|e| SedimentError::Tokenizer(format!("Failed to load tokenizer: {}", e)))?;
 
         // Configure tokenizer for batch processing
         let padding = PaddingParams {
@@ -58,16 +58,17 @@ impl Embedder {
         tokenizer.with_padding(Some(padding));
         tokenizer
             .with_truncation(Some(truncation))
-            .map_err(|e| AlectoError::Tokenizer(format!("Failed to set truncation: {}", e)))?;
+            .map_err(|e| SedimentError::Tokenizer(format!("Failed to set truncation: {}", e)))?;
 
         // Load model weights
         let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[model_path], DTYPE, &device)
-                .map_err(|e| AlectoError::ModelLoading(format!("Failed to load weights: {}", e)))?
+            VarBuilder::from_mmaped_safetensors(&[model_path], DTYPE, &device).map_err(|e| {
+                SedimentError::ModelLoading(format!("Failed to load weights: {}", e))
+            })?
         };
 
         let model = BertModel::load(vb, &config)
-            .map_err(|e| AlectoError::ModelLoading(format!("Failed to load model: {}", e)))?;
+            .map_err(|e| SedimentError::ModelLoading(format!("Failed to load model: {}", e)))?;
 
         info!("Embedding model loaded successfully");
 
@@ -95,7 +96,7 @@ impl Embedder {
         let encodings = self
             .tokenizer
             .encode_batch(texts.to_vec(), true)
-            .map_err(|e| AlectoError::Tokenizer(format!("Tokenization failed: {}", e)))?;
+            .map_err(|e| SedimentError::Tokenizer(format!("Tokenization failed: {}", e)))?;
 
         let token_ids: Vec<Vec<u32>> = encodings.iter().map(|e| e.get_ids().to_vec()).collect();
 
@@ -119,17 +120,17 @@ impl Embedder {
 
         let token_ids_tensor =
             Tensor::from_vec(token_ids_flat, (batch_size, seq_len), &self.device).map_err(|e| {
-                AlectoError::Embedding(format!("Failed to create token tensor: {}", e))
+                SedimentError::Embedding(format!("Failed to create token tensor: {}", e))
             })?;
 
         let attention_mask_tensor =
             Tensor::from_vec(attention_mask_flat, (batch_size, seq_len), &self.device).map_err(
-                |e| AlectoError::Embedding(format!("Failed to create mask tensor: {}", e)),
+                |e| SedimentError::Embedding(format!("Failed to create mask tensor: {}", e)),
             )?;
 
         let token_type_ids_tensor =
             Tensor::from_vec(token_type_ids_flat, (batch_size, seq_len), &self.device).map_err(
-                |e| AlectoError::Embedding(format!("Failed to create type tensor: {}", e)),
+                |e| SedimentError::Embedding(format!("Failed to create type tensor: {}", e)),
             )?;
 
         // Run model
@@ -140,30 +141,30 @@ impl Embedder {
                 &token_type_ids_tensor,
                 Some(&attention_mask_tensor),
             )
-            .map_err(|e| AlectoError::Embedding(format!("Model forward failed: {}", e)))?;
+            .map_err(|e| SedimentError::Embedding(format!("Model forward failed: {}", e)))?;
 
         // Mean pooling with attention mask
         let attention_mask_f32 = attention_mask_tensor
             .to_dtype(DType::F32)
-            .map_err(|e| AlectoError::Embedding(format!("Mask conversion failed: {}", e)))?
+            .map_err(|e| SedimentError::Embedding(format!("Mask conversion failed: {}", e)))?
             .unsqueeze(2)
-            .map_err(|e| AlectoError::Embedding(format!("Unsqueeze failed: {}", e)))?;
+            .map_err(|e| SedimentError::Embedding(format!("Unsqueeze failed: {}", e)))?;
 
         let masked_embeddings = embeddings
             .broadcast_mul(&attention_mask_f32)
-            .map_err(|e| AlectoError::Embedding(format!("Broadcast mul failed: {}", e)))?;
+            .map_err(|e| SedimentError::Embedding(format!("Broadcast mul failed: {}", e)))?;
 
         let sum_embeddings = masked_embeddings
             .sum(1)
-            .map_err(|e| AlectoError::Embedding(format!("Sum failed: {}", e)))?;
+            .map_err(|e| SedimentError::Embedding(format!("Sum failed: {}", e)))?;
 
         let sum_mask = attention_mask_f32
             .sum(1)
-            .map_err(|e| AlectoError::Embedding(format!("Mask sum failed: {}", e)))?;
+            .map_err(|e| SedimentError::Embedding(format!("Mask sum failed: {}", e)))?;
 
         let mean_embeddings = sum_embeddings
             .broadcast_div(&sum_mask)
-            .map_err(|e| AlectoError::Embedding(format!("Division failed: {}", e)))?;
+            .map_err(|e| SedimentError::Embedding(format!("Division failed: {}", e)))?;
 
         // Normalize if requested
         let final_embeddings = if self.normalize {
@@ -175,7 +176,7 @@ impl Embedder {
         // Convert to Vec<Vec<f32>>
         let embeddings_vec: Vec<Vec<f32>> = final_embeddings
             .to_vec2()
-            .map_err(|e| AlectoError::Embedding(format!("Tensor to vec failed: {}", e)))?;
+            .map_err(|e| SedimentError::Embedding(format!("Tensor to vec failed: {}", e)))?;
 
         Ok(embeddings_vec)
     }
@@ -191,21 +192,21 @@ fn download_model(model_id: &str) -> Result<(PathBuf, PathBuf, PathBuf)> {
     let api = ApiBuilder::from_env()
         .with_progress(true)
         .build()
-        .map_err(|e| AlectoError::ModelLoading(format!("Failed to create HF API: {}", e)))?;
+        .map_err(|e| SedimentError::ModelLoading(format!("Failed to create HF API: {}", e)))?;
 
     let repo = api.repo(Repo::new(model_id.to_string(), RepoType::Model));
 
     let model_path = repo
         .get("model.safetensors")
-        .map_err(|e| AlectoError::ModelLoading(format!("Failed to download model: {}", e)))?;
+        .map_err(|e| SedimentError::ModelLoading(format!("Failed to download model: {}", e)))?;
 
     let tokenizer_path = repo
         .get("tokenizer.json")
-        .map_err(|e| AlectoError::ModelLoading(format!("Failed to download tokenizer: {}", e)))?;
+        .map_err(|e| SedimentError::ModelLoading(format!("Failed to download tokenizer: {}", e)))?;
 
     let config_path = repo
         .get("config.json")
-        .map_err(|e| AlectoError::ModelLoading(format!("Failed to download config: {}", e)))?;
+        .map_err(|e| SedimentError::ModelLoading(format!("Failed to download config: {}", e)))?;
 
     Ok((model_path, tokenizer_path, config_path))
 }
@@ -214,15 +215,15 @@ fn download_model(model_id: &str) -> Result<(PathBuf, PathBuf, PathBuf)> {
 fn normalize_l2(tensor: &Tensor) -> Result<Tensor> {
     let norm = tensor
         .sqr()
-        .map_err(|e| AlectoError::Embedding(format!("Sqr failed: {}", e)))?
+        .map_err(|e| SedimentError::Embedding(format!("Sqr failed: {}", e)))?
         .sum_keepdim(1)
-        .map_err(|e| AlectoError::Embedding(format!("Sum keepdim failed: {}", e)))?
+        .map_err(|e| SedimentError::Embedding(format!("Sum keepdim failed: {}", e)))?
         .sqrt()
-        .map_err(|e| AlectoError::Embedding(format!("Sqrt failed: {}", e)))?;
+        .map_err(|e| SedimentError::Embedding(format!("Sqrt failed: {}", e)))?;
 
     tensor
         .broadcast_div(&norm)
-        .map_err(|e| AlectoError::Embedding(format!("Normalize div failed: {}", e)))
+        .map_err(|e| SedimentError::Embedding(format!("Normalize div failed: {}", e)))
 }
 
 #[cfg(test)]

@@ -1,4 +1,4 @@
-//! Alecto: Semantic memory for AI agents
+//! Sediment: Semantic memory for AI agents
 //!
 //! A local-first, MCP-native vector database for AI agent memory.
 //!
@@ -27,7 +27,7 @@ pub use chunker::{ChunkResult, ChunkingConfig, chunk_content};
 pub use db::Database;
 pub use document::ContentType;
 pub use embedder::{EMBEDDING_DIM, Embedder};
-pub use error::{AlectoError, Result};
+pub use error::{Result, SedimentError};
 pub use item::{Chunk, ConflictInfo, Item, ItemFilters, SearchResult, StoreResult};
 pub use retry::{RetryConfig, with_retry};
 
@@ -107,16 +107,16 @@ impl std::fmt::Display for ListScope {
 
 /// Get the central database path.
 ///
-/// Returns `~/.alecto/data` or the path specified in `ALECTO_DB` environment variable.
+/// Returns `~/.sediment/data` or the path specified in `SEDIMENT_DB` environment variable.
 /// Note: LanceDB uses a directory, not a single file.
 pub fn central_db_path() -> PathBuf {
-    if let Ok(path) = std::env::var("ALECTO_DB") {
+    if let Ok(path) = std::env::var("SEDIMENT_DB") {
         return PathBuf::from(path);
     }
 
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".alecto")
+        .join(".sediment")
         .join("data")
 }
 
@@ -125,7 +125,7 @@ pub fn default_db_path() -> PathBuf {
     central_db_path()
 }
 
-/// Project configuration stored in `.alecto/config`
+/// Project configuration stored in `.sediment/config`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectConfig {
     /// Unique project identifier (UUID)
@@ -142,10 +142,10 @@ impl Default for ProjectConfig {
 
 /// Get or create the project ID for a given project root.
 ///
-/// The project ID is stored in `<project_root>/.alecto/config`.
+/// The project ID is stored in `<project_root>/.sediment/config`.
 /// If no config exists, a new UUID is generated and saved.
 pub fn get_or_create_project_id(project_root: &Path) -> std::io::Result<String> {
-    let config_path = project_root.join(".alecto").join("config");
+    let config_path = project_root.join(".sediment").join("config");
 
     // Try to read existing config
     if config_path.exists() {
@@ -158,9 +158,9 @@ pub fn get_or_create_project_id(project_root: &Path) -> std::io::Result<String> 
     // Create new config with generated UUID
     let config = ProjectConfig::default();
 
-    // Ensure .alecto directory exists
-    let alecto_dir = project_root.join(".alecto");
-    std::fs::create_dir_all(&alecto_dir)?;
+    // Ensure .sediment directory exists
+    let sediment_dir = project_root.join(".sediment");
+    std::fs::create_dir_all(&sediment_dir)?;
 
     // Save config
     let content = serde_json::to_string_pretty(&config)
@@ -189,7 +189,7 @@ pub fn boost_similarity(
 
 /// Find the project root by walking up from the given path.
 ///
-/// Looks for directories containing `.alecto/` or `.git/` markers.
+/// Looks for directories containing `.sediment/` or `.git/` markers.
 /// Returns `None` if no project root is found.
 pub fn find_project_root(start: &Path) -> Option<PathBuf> {
     let mut current = start.to_path_buf();
@@ -200,8 +200,8 @@ pub fn find_project_root(start: &Path) -> Option<PathBuf> {
     }
 
     loop {
-        // Check for .alecto directory first (explicit project marker)
-        if current.join(".alecto").is_dir() {
+        // Check for .sediment directory first (explicit project marker)
+        if current.join(".sediment").is_dir() {
             return Some(current);
         }
 
@@ -218,15 +218,15 @@ pub fn find_project_root(start: &Path) -> Option<PathBuf> {
     }
 }
 
-/// Initialize a project directory for Alecto.
+/// Initialize a project directory for Sediment.
 ///
-/// Creates the `.alecto/` directory in the specified path and generates a project ID.
+/// Creates the `.sediment/` directory in the specified path and generates a project ID.
 pub fn init_project(project_root: &Path) -> std::io::Result<PathBuf> {
-    let alecto_dir = project_root.join(".alecto");
-    std::fs::create_dir_all(&alecto_dir)?;
+    let sediment_dir = project_root.join(".sediment");
+    std::fs::create_dir_all(&sediment_dir)?;
 
     // Generate project ID
     get_or_create_project_id(project_root)?;
 
-    Ok(alecto_dir)
+    Ok(sediment_dir)
 }

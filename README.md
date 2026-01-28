@@ -1,4 +1,4 @@
-# Alecto
+# Sediment
 
 Semantic memory for AI agents. Local-first, MCP-native.
 
@@ -7,7 +7,7 @@ Semantic memory for AI agents. Local-first, MCP-native.
 ```bash
 # Via Homebrew
 brew tap rendro/tap
-brew install alecto
+brew install sediment
 
 # Or from source
 cargo install --path .
@@ -15,7 +15,7 @@ cargo install --path .
 
 ## Setup
 
-Add Alecto to your MCP configuration:
+Add Sediment to your MCP configuration:
 
 ### Claude Desktop
 
@@ -24,8 +24,8 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 ```json
 {
   "mcpServers": {
-    "alecto": {
-      "command": "alecto"
+    "sediment": {
+      "command": "sediment"
     }
   }
 }
@@ -33,12 +33,12 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
 ### Claude Code
 
-Run `alecto init` in your project, or add to `~/.claude/CLAUDE.md`:
+Run `sediment init` in your project, or add to `~/.claude/CLAUDE.md`:
 
 ```markdown
-## Alecto Memory System
+## Sediment Memory System
 
-Use the Alecto MCP tools for persistent memory storage.
+Use the Sediment MCP tools for persistent memory storage.
 
 - `store` - Store content for later retrieval
 - `recall` - Search by semantic similarity
@@ -58,16 +58,16 @@ Use the Alecto MCP tools for persistent memory storage.
 ## CLI
 
 ```bash
-alecto           # Start MCP server
-alecto init      # Set up Claude Code integration
-alecto stats     # Show database statistics
-alecto list      # List stored items
+sediment           # Start MCP server
+sediment init      # Set up Claude Code integration
+sediment stats     # Show database statistics
+sediment list      # List stored items
 ```
 
 ## How It Works
 
 - **Storage**: LanceDB (embedded, no server)
 - **Embeddings**: all-MiniLM-L6-v2 (local, no API keys)
-- **Data**: `~/.alecto/data/`
+- **Data**: `~/.sediment/data/`
 
 Everything runs locally. Your data never leaves your machine.
