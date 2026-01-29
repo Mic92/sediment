@@ -38,6 +38,7 @@ Sediment is a semantic memory system for AI agents, running as an MCP (Model Con
 - **`src/db.rs`** - LanceDB wrapper handling vector storage, search, and CRUD operations
 - **`src/embedder.rs`** - Local embeddings using `all-MiniLM-L6-v2` via Candle (384-dim vectors)
 - **`src/chunker.rs`** - Smart content chunking by type (markdown, code, JSON, YAML, text)
+- **`src/access.rs`** - SQLite-based access tracking for memory decay scoring
 
 ### MCP Server (`src/mcp/`)
 
@@ -50,7 +51,7 @@ Sediment is a semantic memory system for AI agents, running as an MCP (Model Con
 
 1. Content → Embedder (generates 384-dim vector) → LanceDB storage
 2. Long content (>1000 chars) → Chunker (type-aware splitting) → Individual chunk embeddings
-3. Search queries → Embedder → Vector similarity search on both items and chunks → Boosted by project context
+3. Search queries → Embedder → Vector similarity search on both items and chunks → Boosted by project context → Decay-scored by freshness and access frequency
 
 ### Key Design Decisions
 
@@ -59,6 +60,7 @@ Sediment is a semantic memory system for AI agents, running as an MCP (Model Con
 - **Similarity boosting**: Same-project items get 1.15x boost, different projects 0.95x penalty
 - **Conflict detection**: Items with >=0.85 similarity flagged on store
 - **Fresh DB connection per tool call** with shared embedder for efficiency
+- **Memory decay scoring**: Recall results are re-ranked using freshness (30-day half-life) and access frequency (log-scaled). Tracked in a SQLite sidecar (`~/.sediment/access.db`) since LanceDB is append-oriented. Old memories are demoted in ranking but never auto-deleted.
 
 ## MCP Tools Reference
 

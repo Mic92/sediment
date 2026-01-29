@@ -688,6 +688,33 @@ impl Database {
     }
 }
 
+// ==================== Decay Scoring ====================
+
+/// Compute a decay-adjusted score for a search result.
+///
+/// Formula: `similarity * freshness * frequency`
+/// - freshness = 1.0 / (1.0 + age_days / 30.0)  (half-life ~30 days)
+/// - frequency = 1.0 + 0.1 * ln(1 + access_count)
+///
+/// `last_accessed_at` and `created_at` are unix timestamps.
+/// If no access record exists, pass `access_count=0` and use `created_at` for age.
+pub fn score_with_decay(
+    similarity: f32,
+    now: i64,
+    created_at: i64,
+    access_count: u32,
+    last_accessed_at: Option<i64>,
+) -> f32 {
+    let reference_time = last_accessed_at.unwrap_or(created_at);
+    let age_secs = (now - reference_time).max(0) as f64;
+    let age_days = age_secs / 86400.0;
+
+    let freshness = 1.0 / (1.0 + age_days / 30.0);
+    let frequency = 1.0 + 0.1 * (1.0 + access_count as f64).ln();
+
+    similarity * (freshness * frequency) as f32
+}
+
 // ==================== Helper Functions ====================
 
 /// Apply similarity boosting based on project context.
@@ -1001,4 +1028,51 @@ fn create_embedding_array(embedding: &[f32]) -> Result<FixedSizeListArray> {
 
     FixedSizeListArray::try_new(field, EMBEDDING_DIM as i32, Arc::new(values), None)
         .map_err(|e| SedimentError::Database(format!("Failed to create vector: {}", e)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_score_with_decay_fresh_item() {
+        let now = 1700000000i64;
+        let created = now; // just created
+        let score = score_with_decay(0.8, now, created, 0, None);
+        // freshness = 1.0, frequency = 1.0 + 0.1 * ln(1) = 1.0
+        let expected = 0.8 * 1.0 * 1.0;
+        assert!((score - expected).abs() < 0.001, "got {}", score);
+    }
+
+    #[test]
+    fn test_score_with_decay_30_day_old() {
+        let now = 1700000000i64;
+        let created = now - 30 * 86400; // 30 days old
+        let score = score_with_decay(0.8, now, created, 0, None);
+        // freshness = 1/(1+1) = 0.5, frequency = 1.0
+        let expected = 0.8 * 0.5;
+        assert!((score - expected).abs() < 0.001, "got {}", score);
+    }
+
+    #[test]
+    fn test_score_with_decay_frequent_access() {
+        let now = 1700000000i64;
+        let created = now - 30 * 86400;
+        let last_accessed = now; // just accessed
+        let score = score_with_decay(0.8, now, created, 10, Some(last_accessed));
+        // freshness = 1.0 (just accessed), frequency = 1.0 + 0.1 * ln(11) ≈ 1.2397
+        let freq = 1.0 + 0.1 * (11.0_f64).ln();
+        let expected = 0.8 * 1.0 * freq as f32;
+        assert!((score - expected).abs() < 0.01, "got {}", score);
+    }
+
+    #[test]
+    fn test_score_with_decay_old_and_unused() {
+        let now = 1700000000i64;
+        let created = now - 90 * 86400; // 90 days old
+        let score = score_with_decay(0.8, now, created, 0, None);
+        // freshness = 1/(1+3) = 0.25
+        let expected = 0.8 * 0.25;
+        assert!((score - expected).abs() < 0.001, "got {}", score);
+    }
 }

@@ -68,6 +68,7 @@ sediment list      # List stored items
 
 - **Storage**: LanceDB (embedded, no server)
 - **Embeddings**: all-MiniLM-L6-v2 (local, no API keys)
+- **Memory decay**: Recent and frequently-accessed memories rank higher in recall. Old memories are never deleted, just ranked lower.
 - **Data**: `~/.sediment/data/`
 
 Everything runs locally. Your data never leaves your machine.

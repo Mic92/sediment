@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
+pub mod access;
 pub mod chunker;
 pub mod db;
 pub mod document;

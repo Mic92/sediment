@@ -6,6 +6,8 @@ use chrono::DateTime;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::access::AccessTracker;
+use crate::db::score_with_decay;
 use crate::item::{Item, ItemFilters};
 use crate::retry::{RetryConfig, with_retry};
 use crate::{Database, ListScope, StoreScope};
@@ -213,10 +215,14 @@ pub async fn execute_tool(ctx: &ServerContext, name: &str, args: Option<Value>) 
             .await
             .map_err(|e| format!("Failed to open database: {}", e))?;
 
+            // Open access tracker
+            let tracker = AccessTracker::open(&ctx_ref.access_db_path)
+                .map_err(|e| format!("Failed to open access tracker: {}", e))?;
+
             // Execute the tool
             let result = match name_ref {
                 "store" => execute_store(&mut db, args_clone).await,
-                "recall" => execute_recall(&mut db, args_clone).await,
+                "recall" => execute_recall(&mut db, &tracker, args_clone).await,
                 "list" => execute_list(&mut db, args_clone).await,
                 "forget" => execute_forget(&mut db, args_clone).await,
                 _ => return Ok(CallToolResult::error(format!("Unknown tool: {}", name_ref))),
@@ -369,7 +375,11 @@ async fn execute_store(db: &mut Database, args: Option<Value>) -> CallToolResult
     }
 }
 
-async fn execute_recall(db: &mut Database, args: Option<Value>) -> CallToolResult {
+async fn execute_recall(
+    db: &mut Database,
+    tracker: &AccessTracker,
+    args: Option<Value>,
+) -> CallToolResult {
     let params: RecallParams = match args {
         Some(v) => match serde_json::from_value(v) {
             Ok(p) => p,
@@ -388,42 +398,74 @@ async fn execute_recall(db: &mut Database, args: Option<Value>) -> CallToolResul
     }
 
     match db.search_items(&params.query, limit, filters).await {
-        Ok(results) => {
+        Ok(mut results) => {
             if results.is_empty() {
-                CallToolResult::success("No items found matching your query.")
-            } else {
-                let formatted: Vec<Value> = results
-                    .iter()
-                    .map(|r| {
-                        let mut obj = json!({
-                            "id": r.id,
-                            "content": r.content,
-                            "similarity": format!("{:.2}", r.similarity),
-                            "created": r.created_at.to_rfc3339(),
-                        });
-
-                        // Add optional fields
-                        if let Some(ref excerpt) = r.relevant_excerpt {
-                            obj["relevant_excerpt"] = json!(excerpt);
-                        }
-                        if !r.tags.is_empty() {
-                            obj["tags"] = json!(r.tags);
-                        }
-                        if let Some(ref source) = r.source {
-                            obj["source"] = json!(source);
-                        }
-
-                        obj
-                    })
-                    .collect();
-
-                let result = json!({
-                    "count": results.len(),
-                    "results": formatted
-                });
-
-                CallToolResult::success(serde_json::to_string_pretty(&result).unwrap())
+                return CallToolResult::success("No items found matching your query.");
             }
+
+            // Fetch access records for decay scoring
+            let item_ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
+            let access_records = tracker.get_accesses(&item_ids).unwrap_or_default();
+
+            let now = chrono::Utc::now().timestamp();
+
+            // Re-score with decay
+            for result in &mut results {
+                let created_at = result.created_at.timestamp();
+                let (access_count, last_accessed) = match access_records.get(&result.id) {
+                    Some(rec) => (rec.access_count, Some(rec.last_accessed_at)),
+                    None => (0, None),
+                };
+
+                result.similarity = score_with_decay(
+                    result.similarity,
+                    now,
+                    created_at,
+                    access_count,
+                    last_accessed,
+                );
+            }
+
+            // Re-sort by decay-adjusted score
+            results.sort_by(|a, b| b.similarity.partial_cmp(&a.similarity).unwrap());
+
+            // Record access for returned items
+            for result in &results {
+                let created_at = result.created_at.timestamp();
+                let _ = tracker.record_access(&result.id, created_at);
+            }
+
+            let formatted: Vec<Value> = results
+                .iter()
+                .map(|r| {
+                    let mut obj = json!({
+                        "id": r.id,
+                        "content": r.content,
+                        "similarity": format!("{:.2}", r.similarity),
+                        "created": r.created_at.to_rfc3339(),
+                    });
+
+                    // Add optional fields
+                    if let Some(ref excerpt) = r.relevant_excerpt {
+                        obj["relevant_excerpt"] = json!(excerpt);
+                    }
+                    if !r.tags.is_empty() {
+                        obj["tags"] = json!(r.tags);
+                    }
+                    if let Some(ref source) = r.source {
+                        obj["source"] = json!(source);
+                    }
+
+                    obj
+                })
+                .collect();
+
+            let result = json!({
+                "count": results.len(),
+                "results": formatted
+            });
+
+            CallToolResult::success(serde_json::to_string_pretty(&result).unwrap())
         }
         Err(e) => CallToolResult::error(format!("Search failed: {}", e)),
     }

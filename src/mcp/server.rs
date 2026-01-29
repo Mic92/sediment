@@ -20,6 +20,8 @@ use super::tools::{execute_tool, get_tools};
 pub struct ServerContext {
     /// Path to the database directory
     pub db_path: PathBuf,
+    /// Path to the access tracking SQLite database
+    pub access_db_path: PathBuf,
     /// Optional project ID for scoped operations
     pub project_id: Option<String>,
     /// Shared embedder instance (expensive to create, loaded once)
@@ -36,9 +38,16 @@ pub fn run(db_path: &Path, project_id: Option<String>) -> Result<()> {
     let embedder = Arc::new(Embedder::new().context("Failed to load embedder")?);
     tracing::info!("Embedder loaded successfully");
 
+    // Derive access DB path as sibling to the LanceDB data directory
+    let access_db_path = db_path
+        .parent()
+        .unwrap_or(db_path)
+        .join("access.db");
+
     // Create server context with shared resources
     let ctx = ServerContext {
         db_path: db_path.to_path_buf(),
+        access_db_path,
         project_id,
         embedder,
     };
