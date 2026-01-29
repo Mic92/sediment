@@ -41,6 +41,9 @@ dialoguer = "0.11"
 # Access tracking
 rusqlite = { version = "0.31", features = ["bundled"] }
 
+# Graph database
+kuzu = "0.11"
+
 # Utils
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
@@ -50,6 +53,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dirs = "5"
 futures = "0.3"
+
+[build-dependencies]
+cxx-build = "=1.0.138"
 
 [dev-dependencies]
 tempfile = "3"

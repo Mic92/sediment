@@ -16,10 +16,12 @@ use uuid::Uuid;
 
 pub mod access;
 pub mod chunker;
+pub mod consolidation;
 pub mod db;
 pub mod document;
 pub mod embedder;
 pub mod error;
+pub mod graph;
 pub mod item;
 pub mod mcp;
 pub mod retry;

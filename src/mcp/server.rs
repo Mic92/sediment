@@ -6,6 +6,7 @@ use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::runtime::Runtime;
+use tokio::sync::Semaphore;
 
 use crate::Embedder;
 
@@ -22,10 +23,18 @@ pub struct ServerContext {
     pub db_path: PathBuf,
     /// Path to the access tracking SQLite database
     pub access_db_path: PathBuf,
+    /// Path to the Kuzu graph database directory
+    pub graph_path: PathBuf,
     /// Optional project ID for scoped operations
     pub project_id: Option<String>,
     /// Shared embedder instance (expensive to create, loaded once)
     pub embedder: Arc<Embedder>,
+    /// Current working directory (for provenance tracking)
+    pub cwd: PathBuf,
+    /// Semaphore to ensure only one consolidation task runs at a time
+    pub consolidation_semaphore: Arc<Semaphore>,
+    /// Counter for consolidation runs (for periodic clustering)
+    pub consolidation_run_count: std::sync::atomic::AtomicU64,
 }
 
 /// Run the MCP server
@@ -39,17 +48,25 @@ pub fn run(db_path: &Path, project_id: Option<String>) -> Result<()> {
     tracing::info!("Embedder loaded successfully");
 
     // Derive access DB path as sibling to the LanceDB data directory
-    let access_db_path = db_path
+    let sediment_dir = db_path
         .parent()
-        .unwrap_or(db_path)
-        .join("access.db");
+        .unwrap_or(db_path);
+    let access_db_path = sediment_dir.join("access.db");
+    let graph_path = sediment_dir.join("graph");
+
+    // Get current working directory
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
     // Create server context with shared resources
     let ctx = ServerContext {
         db_path: db_path.to_path_buf(),
         access_db_path,
+        graph_path,
         project_id,
         embedder,
+        cwd,
+        consolidation_semaphore: Arc::new(Semaphore::new(1)),
+        consolidation_run_count: std::sync::atomic::AtomicU64::new(0),
     };
 
     let stdin = io::stdin();

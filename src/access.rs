@@ -42,6 +42,11 @@ impl AccessTracker {
             SedimentError::Database(format!("Failed to create access_log table: {}", e))
         })?;
 
+        // Idempotent schema migration: add validation_count column
+        let _ = conn.execute_batch(
+            "ALTER TABLE access_log ADD COLUMN validation_count INTEGER NOT NULL DEFAULT 0;"
+        );
+
         Ok(Self { conn })
     }
 
@@ -61,6 +66,36 @@ impl AccessTracker {
                 SedimentError::Database(format!("Failed to record access: {}", e))
             })?;
         Ok(())
+    }
+
+    /// Record a validation (replace/confirm) for an item.
+    pub fn record_validation(&self, item_id: &str, created_at: i64) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        self.conn
+            .execute(
+                "INSERT INTO access_log (item_id, access_count, last_accessed_at, created_at, validation_count)
+                 VALUES (?1, 0, ?2, ?3, 1)
+                 ON CONFLICT(item_id) DO UPDATE SET
+                     validation_count = validation_count + 1,
+                     last_accessed_at = ?2",
+                params![item_id, now, created_at],
+            )
+            .map_err(|e| {
+                SedimentError::Database(format!("Failed to record validation: {}", e))
+            })?;
+        Ok(())
+    }
+
+    /// Get validation count for an item.
+    pub fn get_validation_count(&self, item_id: &str) -> Result<u32> {
+        let count: u32 = self.conn
+            .query_row(
+                "SELECT COALESCE(validation_count, 0) FROM access_log WHERE item_id = ?1",
+                params![item_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        Ok(count)
     }
 
     /// Get access records for a batch of item IDs.

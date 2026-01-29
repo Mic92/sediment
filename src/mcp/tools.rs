@@ -1,13 +1,17 @@
 //! MCP Tool definitions for Sediment
 //!
-//! Simplified unified API with 4 tools: store, recall, list, forget
+//! 5 tools: store, recall, list, forget, connections
+
+use std::sync::Arc;
 
 use chrono::DateTime;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::access::AccessTracker;
+use crate::consolidation::{ConsolidationQueue, spawn_consolidation};
 use crate::db::score_with_decay;
+use crate::graph::GraphStore;
 use crate::item::{Item, ItemFilters};
 use crate::retry::{RetryConfig, with_retry};
 use crate::{Database, ListScope, StoreScope};
@@ -15,7 +19,7 @@ use crate::{Database, ListScope, StoreScope};
 use super::protocol::{CallToolResult, Tool};
 use super::server::ServerContext;
 
-/// Get all available tools (4 total)
+/// Get all available tools (5 total)
 pub fn get_tools() -> Vec<Tool> {
     vec![
         Tool {
@@ -58,6 +62,11 @@ pub fn get_tools() -> Vec<Tool> {
                     "replace": {
                         "type": "string",
                         "description": "ID of an existing item to replace (atomically delete before storing)"
+                    },
+                    "related": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "IDs of related items to link in the knowledge graph"
                     }
                 },
                 "required": ["content"]
@@ -131,12 +140,25 @@ pub fn get_tools() -> Vec<Tool> {
                 "required": ["id"]
             }),
         },
+        Tool {
+            name: "connections".to_string(),
+            description: "Show the relationship graph for a stored item. Returns all connections including related items, superseded items, and frequently co-accessed items.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "description": "The item ID to show connections for"
+                    }
+                },
+                "required": ["id"]
+            }),
+        },
     ]
 }
 
 // ========== Parameter Structs ==========
 
-/// Parameters for store tool
 #[derive(Debug, Deserialize)]
 pub struct StoreParams {
     pub content: String,
@@ -152,12 +174,12 @@ pub struct StoreParams {
     pub expires_at: Option<String>,
     #[serde(default)]
     pub scope: Option<String>,
-    /// ID of an existing item to replace (atomically delete before storing)
     #[serde(default)]
     pub replace: Option<String>,
+    #[serde(default)]
+    pub related: Option<Vec<String>>,
 }
 
-/// Parameters for recall tool
 #[derive(Debug, Deserialize)]
 pub struct RecallParams {
     pub query: String,
@@ -169,7 +191,6 @@ pub struct RecallParams {
     pub min_similarity: Option<f32>,
 }
 
-/// Parameters for list tool
 #[derive(Debug, Deserialize)]
 pub struct ListParams {
     #[serde(default)]
@@ -180,24 +201,20 @@ pub struct ListParams {
     pub scope: Option<String>,
 }
 
-/// Parameters for forget tool
 #[derive(Debug, Deserialize)]
 pub struct ForgetParams {
     pub id: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ConnectionsParams {
+    pub id: String,
+}
+
 // ========== Tool Execution ==========
 
-/// Execute a tool with retry logic and fresh DB connection per call.
-///
-/// Each tool call:
-/// 1. Opens a fresh database connection (using the shared embedder)
-/// 2. Executes the operation
-/// 3. Retries on transient failures with exponential backoff
 pub async fn execute_tool(ctx: &ServerContext, name: &str, args: Option<Value>) -> CallToolResult {
     let config = RetryConfig::default();
-
-    // Clone args for potential retries (args is consumed on each attempt)
     let args_for_retry = args.clone();
 
     let result = with_retry(&config, || {
@@ -219,18 +236,20 @@ pub async fn execute_tool(ctx: &ServerContext, name: &str, args: Option<Value>) 
             let tracker = AccessTracker::open(&ctx_ref.access_db_path)
                 .map_err(|e| format!("Failed to open access tracker: {}", e))?;
 
-            // Execute the tool
+            // Open graph store (lazy init)
+            let graph = GraphStore::open(&ctx_ref.graph_path)
+                .map_err(|e| format!("Failed to open graph store: {}", e))?;
+
             let result = match name_ref {
-                "store" => execute_store(&mut db, args_clone).await,
-                "recall" => execute_recall(&mut db, &tracker, args_clone).await,
+                "store" => execute_store(&mut db, &tracker, &graph, ctx_ref, args_clone).await,
+                "recall" => execute_recall(&mut db, &tracker, &graph, ctx_ref, args_clone).await,
                 "list" => execute_list(&mut db, args_clone).await,
-                "forget" => execute_forget(&mut db, args_clone).await,
+                "forget" => execute_forget(&mut db, &graph, args_clone).await,
+                "connections" => execute_connections(&mut db, &graph, args_clone).await,
                 _ => return Ok(CallToolResult::error(format!("Unknown tool: {}", name_ref))),
             };
 
-            // Check if result indicates an error that should be retried
             if result.is_error.unwrap_or(false) {
-                // Check if it's a connection-related error worth retrying
                 if let Some(content) = result.content.first() {
                     if is_retryable_error(&content.text) {
                         return Err(content.text.clone());
@@ -249,7 +268,6 @@ pub async fn execute_tool(ctx: &ServerContext, name: &str, args: Option<Value>) 
     }
 }
 
-/// Check if an error message indicates a transient/retryable failure
 fn is_retryable_error(error_msg: &str) -> bool {
     let retryable_patterns = [
         "connection",
@@ -270,7 +288,13 @@ fn is_retryable_error(error_msg: &str) -> bool {
 
 // ========== Tool Implementations ==========
 
-async fn execute_store(db: &mut Database, args: Option<Value>) -> CallToolResult {
+async fn execute_store(
+    db: &mut Database,
+    tracker: &AccessTracker,
+    graph: &GraphStore,
+    ctx: &ServerContext,
+    args: Option<Value>,
+) -> CallToolResult {
     let params: StoreParams = match args {
         Some(v) => match serde_json::from_value(v) {
             Ok(p) => p,
@@ -301,11 +325,14 @@ async fn execute_store(db: &mut Database, args: Option<Value>) -> CallToolResult
         None
     };
 
-    // Handle replace: delete the existing item first
-    if let Some(ref replace_id) = params.replace {
+    // Handle replace: delete the existing item first, record provenance
+    let replaced_id = if let Some(ref replace_id) = params.replace {
         match db.delete_item(replace_id).await {
             Ok(true) => {
-                // Item was deleted, continue with storing new one
+                // Record validation for the new item being stored
+                let now = chrono::Utc::now().timestamp();
+                let _ = tracker.record_validation(replace_id, now);
+                Some(replace_id.clone())
             }
             Ok(false) => {
                 return CallToolResult::error(format!(
@@ -317,10 +344,13 @@ async fn execute_store(db: &mut Database, args: Option<Value>) -> CallToolResult
                 return CallToolResult::error(format!("Failed to delete item for replace: {}", e));
             }
         }
-    }
+    } else {
+        None
+    };
 
     // Build item
-    let mut item = Item::new(&params.content).with_tags(params.tags.unwrap_or_default());
+    let mut tags = params.tags.unwrap_or_default();
+    let mut item = Item::new(&params.content).with_tags(tags.clone());
 
     if let Some(title) = params.title {
         item = item.with_title(title);
@@ -330,9 +360,19 @@ async fn execute_store(db: &mut Database, args: Option<Value>) -> CallToolResult
         item = item.with_source(source);
     }
 
-    if let Some(metadata) = params.metadata {
-        item = item.with_metadata(metadata);
+    // Build metadata with provenance
+    let mut metadata = params.metadata.unwrap_or(json!({}));
+    if let Some(obj) = metadata.as_object_mut() {
+        let mut provenance = json!({
+            "v": 1,
+            "project_path": ctx.cwd.to_string_lossy()
+        });
+        if let Some(ref rid) = replaced_id {
+            provenance["supersedes"] = json!(rid);
+        }
+        obj.insert("_provenance".to_string(), provenance);
     }
+    item = item.with_metadata(metadata);
 
     if let Some(exp) = expires_at {
         item = item.with_expires_at(exp);
@@ -345,15 +385,71 @@ async fn execute_store(db: &mut Database, args: Option<Value>) -> CallToolResult
         }
     }
 
+    // Auto-tag inference (Phase 4a): if no user tags, infer from similar items
+    if tags.is_empty() {
+        if let Ok(similar) = db.find_similar_items(&params.content, 0.85, 5).await {
+            let mut tag_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+            for conflict in &similar {
+                if let Some(similar_item) = db.get_item(&conflict.id).await.ok().flatten() {
+                    for tag in &similar_item.tags {
+                        if !tag.starts_with("auto:") {
+                            *tag_counts.entry(tag.clone()).or_insert(0) += 1;
+                        }
+                    }
+                }
+            }
+            // If 2+ similar items share a tag, auto-apply it
+            let auto_tags: Vec<String> = tag_counts
+                .into_iter()
+                .filter(|(_, count)| *count >= 2)
+                .map(|(tag, _)| format!("auto:{}", tag))
+                .collect();
+            if !auto_tags.is_empty() {
+                tags = item.tags.clone();
+                tags.extend(auto_tags);
+                item = item.with_tags(tags);
+            }
+        }
+    }
+
     match db.store_item(item).await {
         Ok(store_result) => {
+            let new_id = store_result.id.clone();
+
+            // Create graph node
+            let now = chrono::Utc::now().timestamp();
+            let project_id = db.project_id().map(|s| s.to_string());
+            let _ = graph.add_node(&new_id, project_id.as_deref(), now);
+
+            // Create SUPERSEDES edge if replacing
+            if let Some(ref old_id) = replaced_id {
+                // The old node might still exist in graph; create edge then remove
+                let _ = graph.add_supersedes_edge(&new_id, old_id);
+                let _ = graph.remove_node(old_id);
+            }
+
+            // Create RELATED edges if specified
+            if let Some(ref related_ids) = params.related {
+                for rid in related_ids {
+                    let _ = graph.add_related_edge(&new_id, rid, 1.0, "user_linked");
+                }
+            }
+
+            // Enqueue consolidation candidates from conflicts
+            if !store_result.potential_conflicts.is_empty() {
+                if let Ok(queue) = ConsolidationQueue::open(&ctx.access_db_path) {
+                    for conflict in &store_result.potential_conflicts {
+                        let _ = queue.enqueue(&new_id, &conflict.id, conflict.similarity as f64);
+                    }
+                }
+            }
+
             let mut result = json!({
                 "success": true,
-                "id": store_result.id,
+                "id": new_id,
                 "message": format!("Stored in {} scope", scope)
             });
 
-            // Include potential conflicts if any
             if !store_result.potential_conflicts.is_empty() {
                 let conflicts: Vec<Value> = store_result
                     .potential_conflicts
@@ -378,6 +474,8 @@ async fn execute_store(db: &mut Database, args: Option<Value>) -> CallToolResult
 async fn execute_recall(
     db: &mut Database,
     tracker: &AccessTracker,
+    graph: &GraphStore,
+    ctx: &ServerContext,
     args: Option<Value>,
 ) -> CallToolResult {
     let params: RecallParams = match args {
@@ -403,13 +501,26 @@ async fn execute_recall(
                 return CallToolResult::success("No items found matching your query.");
             }
 
+            // Lazy graph backfill (Phase 2c): ensure nodes exist for all results
+            for result in &results {
+                let project_id = db.get_item(&result.id).await
+                    .ok()
+                    .flatten()
+                    .and_then(|item| item.project_id.clone());
+                let _ = graph.ensure_node_exists(
+                    &result.id,
+                    project_id.as_deref(),
+                    result.created_at.timestamp(),
+                );
+            }
+
             // Fetch access records for decay scoring
             let item_ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
             let access_records = tracker.get_accesses(&item_ids).unwrap_or_default();
 
             let now = chrono::Utc::now().timestamp();
 
-            // Re-score with decay
+            // Re-score with decay + trust (Phase 4d)
             for result in &mut results {
                 let created_at = result.created_at.timestamp();
                 let (access_count, last_accessed) = match access_records.get(&result.id) {
@@ -417,13 +528,22 @@ async fn execute_recall(
                     None => (0, None),
                 };
 
-                result.similarity = score_with_decay(
+                let base_score = score_with_decay(
                     result.similarity,
                     now,
                     created_at,
                     access_count,
                     last_accessed,
                 );
+
+                // Trust bonus: validation_count + edge_count
+                let validation_count = tracker.get_validation_count(&result.id).unwrap_or(0);
+                let edge_count = graph.get_edge_count(&result.id).unwrap_or(0);
+                let trust_bonus = 1.0
+                    + 0.05 * (1.0 + validation_count as f64).ln() as f32
+                    + 0.02 * edge_count as f32;
+
+                result.similarity = base_score * trust_bonus;
             }
 
             // Re-sort by decay-adjusted score
@@ -433,6 +553,49 @@ async fn execute_recall(
             for result in &results {
                 let created_at = result.created_at.timestamp();
                 let _ = tracker.record_access(&result.id, created_at);
+            }
+
+            // Graph-aware recall (Phase 2d): 1-hop expansion
+            let top_ids: Vec<&str> = results.iter().take(5).map(|r| r.id.as_str()).collect();
+            let existing_ids: std::collections::HashSet<String> =
+                results.iter().map(|r| r.id.clone()).collect();
+
+            let mut graph_expanded = Vec::new();
+            if let Ok(neighbors) = graph.get_neighbors(&top_ids, 0.5) {
+                for (neighbor_id, rel_type, _strength) in neighbors {
+                    if existing_ids.contains(&neighbor_id) {
+                        continue;
+                    }
+                    if let Ok(Some(item)) = db.get_item(&neighbor_id).await {
+                        let sr = crate::item::SearchResult::from_item(&item, 0.05); // small bonus
+                        graph_expanded.push(json!({
+                            "id": sr.id,
+                            "content": sr.content,
+                            "similarity": "graph",
+                            "created": sr.created_at.to_rfc3339(),
+                            "graph_expanded": true,
+                            "rel_type": rel_type,
+                        }));
+                    }
+                }
+            }
+
+            // Proactive suggestions (Phase 3b): co-accessed items
+            let mut suggested = Vec::new();
+            let top3_ids: Vec<&str> = results.iter().take(3).map(|r| r.id.as_str()).collect();
+            if let Ok(co_accessed) = graph.get_co_accessed(&top3_ids, 3) {
+                for (co_id, co_count) in co_accessed {
+                    if existing_ids.contains(&co_id) {
+                        continue;
+                    }
+                    if let Ok(Some(item)) = db.get_item(&co_id).await {
+                        suggested.push(json!({
+                            "id": item.id,
+                            "content": truncate(&item.content, 100),
+                            "reason": format!("frequently recalled with result (co-accessed {} times)", co_count),
+                        }));
+                    }
+                }
             }
 
             let formatted: Vec<Value> = results
@@ -445,7 +608,6 @@ async fn execute_recall(
                         "created": r.created_at.to_rfc3339(),
                     });
 
-                    // Add optional fields
                     if let Some(ref excerpt) = r.relevant_excerpt {
                         obj["relevant_excerpt"] = json!(excerpt);
                     }
@@ -456,16 +618,94 @@ async fn execute_recall(
                         obj["source"] = json!(source);
                     }
 
+                    // Cross-project flag (Phase 3c)
+                    if let Some(ref current_pid) = ctx.project_id {
+                        if let Ok(Some(item)) = futures::executor::block_on(db.get_item(&r.id)) {
+                            if let Some(ref item_pid) = item.project_id {
+                                if item_pid != current_pid {
+                                    obj["cross_project"] = json!(true);
+                                    // Try to get project_path from metadata provenance
+                                    if let Some(ref meta) = item.metadata {
+                                        if let Some(prov) = meta.get("_provenance") {
+                                            if let Some(pp) = prov.get("project_path") {
+                                                obj["project_path"] = pp.clone();
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Related IDs from graph (Phase 1d)
+                    if let Ok(neighbors) = graph.get_neighbors(&[r.id.as_str()], 0.5) {
+                        let related: Vec<String> = neighbors
+                            .iter()
+                            .map(|(id, _, _)| id.clone())
+                            .collect();
+                        if !related.is_empty() {
+                            obj["related_ids"] = json!(related);
+                        }
+                    }
+
                     obj
                 })
                 .collect();
 
-            let result = json!({
+            let mut result_json = json!({
                 "count": results.len(),
                 "results": formatted
             });
 
-            CallToolResult::success(serde_json::to_string_pretty(&result).unwrap())
+            if !graph_expanded.is_empty() {
+                result_json["graph_expanded"] = json!(graph_expanded);
+            }
+
+            if !suggested.is_empty() {
+                result_json["suggested"] = json!(suggested);
+            }
+
+            // Fire-and-forget: background consolidation (Phase 2b)
+            spawn_consolidation(
+                Arc::new(ctx.db_path.clone()),
+                Arc::new(ctx.access_db_path.clone()),
+                Arc::new(ctx.graph_path.clone()),
+                ctx.project_id.clone(),
+                ctx.embedder.clone(),
+                ctx.consolidation_semaphore.clone(),
+            );
+
+            // Fire-and-forget: co-access recording (Phase 3a)
+            let result_ids: Vec<String> = results.iter().map(|r| r.id.clone()).collect();
+            let graph_path = ctx.graph_path.clone();
+            tokio::spawn(async move {
+                if let Ok(g) = GraphStore::open(&graph_path) {
+                    let _ = g.record_co_access(&result_ids);
+                }
+            });
+
+            // Periodic clustering (Phase 4b): every 10th consolidation run
+            let run_count = ctx.consolidation_run_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if run_count % 10 == 9 {
+                let graph_path = ctx.graph_path.clone();
+                tokio::spawn(async move {
+                    if let Ok(g) = GraphStore::open(&graph_path) {
+                        if let Ok(clusters) = g.detect_clusters() {
+                            for (a, b, c) in &clusters {
+                                let label = format!("cluster-{}", &a[..8.min(a.len())]);
+                                let _ = g.add_related_edge(a, b, 0.8, &label);
+                                let _ = g.add_related_edge(b, c, 0.8, &label);
+                                let _ = g.add_related_edge(a, c, 0.8, &label);
+                            }
+                            if !clusters.is_empty() {
+                                tracing::info!("Detected {} clusters", clusters.len());
+                            }
+                        }
+                    }
+                });
+            }
+
+            CallToolResult::success(serde_json::to_string_pretty(&result_json).unwrap())
         }
         Err(e) => CallToolResult::error(format!("Search failed: {}", e)),
     }
@@ -488,7 +728,6 @@ async fn execute_list(db: &mut Database, args: Option<Value>) -> CallToolResult 
         filters = filters.with_tags(tags);
     }
 
-    // Parse scope
     let scope = params
         .scope
         .as_deref()
@@ -541,7 +780,7 @@ async fn execute_list(db: &mut Database, args: Option<Value>) -> CallToolResult 
     }
 }
 
-async fn execute_forget(db: &mut Database, args: Option<Value>) -> CallToolResult {
+async fn execute_forget(db: &mut Database, graph: &GraphStore, args: Option<Value>) -> CallToolResult {
     let params: ForgetParams = match args {
         Some(v) => match serde_json::from_value(v) {
             Ok(p) => p,
@@ -552,6 +791,9 @@ async fn execute_forget(db: &mut Database, args: Option<Value>) -> CallToolResul
 
     match db.delete_item(&params.id).await {
         Ok(true) => {
+            // Remove from graph
+            let _ = graph.remove_node(&params.id);
+
             let result = json!({
                 "success": true,
                 "message": format!("Deleted item: {}", params.id)
@@ -560,6 +802,60 @@ async fn execute_forget(db: &mut Database, args: Option<Value>) -> CallToolResul
         }
         Ok(false) => CallToolResult::error(format!("Item not found: {}", params.id)),
         Err(e) => CallToolResult::error(format!("Failed to delete: {}", e)),
+    }
+}
+
+async fn execute_connections(
+    db: &mut Database,
+    graph: &GraphStore,
+    args: Option<Value>,
+) -> CallToolResult {
+    let params: ConnectionsParams = match args {
+        Some(v) => match serde_json::from_value(v) {
+            Ok(p) => p,
+            Err(e) => return CallToolResult::error(format!("Invalid parameters: {}", e)),
+        },
+        None => return CallToolResult::error("Missing parameters"),
+    };
+
+    // Verify item exists
+    match db.get_item(&params.id).await {
+        Ok(None) => return CallToolResult::error(format!("Item not found: {}", params.id)),
+        Err(e) => return CallToolResult::error(format!("Failed to get item: {}", e)),
+        Ok(Some(_)) => {}
+    }
+
+    match graph.get_full_connections(&params.id) {
+        Ok(connections) => {
+            let mut conn_json: Vec<Value> = Vec::new();
+
+            for conn in &connections {
+                let mut obj = json!({
+                    "id": conn.target_id,
+                    "type": conn.rel_type,
+                    "strength": conn.strength,
+                });
+
+                if let Some(count) = conn.count {
+                    obj["count"] = json!(count);
+                }
+
+                // Add content preview
+                if let Ok(Some(item)) = db.get_item(&conn.target_id).await {
+                    obj["content_preview"] = json!(truncate(&item.content, 80));
+                }
+
+                conn_json.push(obj);
+            }
+
+            let result = json!({
+                "item_id": params.id,
+                "connections": conn_json
+            });
+
+            CallToolResult::success(serde_json::to_string_pretty(&result).unwrap())
+        }
+        Err(e) => CallToolResult::error(format!("Failed to get connections: {}", e)),
     }
 }
 
