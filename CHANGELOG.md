@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.2.1] - 2025-05-21
+
+### Added
+- crates.io publishing (`cargo install sediment`)
+- Shell installer (`install.sh`) for macOS and Linux
+- README: badges, "Why Sediment?" section, comparison table, setup guides for 6 MCP clients
+- Performance section with benchmark summary
+- CONTRIBUTING.md, CHANGELOG.md, GitHub issue templates
+- BENCHMARKS.md with recall latency methodology
+- MIT LICENSE file
+
 ## [0.2.0] - 2025-05-20
 
 ### Changed
