@@ -4,6 +4,7 @@
 
 mod protocol;
 mod server;
-mod tools;
+pub mod tools;
 
 pub use server::run;
+pub use tools::{RecallConfig, RecallResult, recall_pipeline};

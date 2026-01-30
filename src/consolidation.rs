@@ -127,7 +127,6 @@ impl ConsolidationQueue {
 pub fn spawn_consolidation(
     db_path: Arc<std::path::PathBuf>,
     access_db_path: Arc<std::path::PathBuf>,
-    graph_path: Arc<std::path::PathBuf>,
     project_id: Option<String>,
     embedder: Arc<crate::Embedder>,
     semaphore: Arc<tokio::sync::Semaphore>,
@@ -145,7 +144,6 @@ pub fn spawn_consolidation(
         if let Err(e) = run_consolidation_batch(
             &db_path,
             &access_db_path,
-            &graph_path,
             project_id,
             embedder,
         ).await {
@@ -160,7 +158,6 @@ pub fn spawn_consolidation(
 async fn run_consolidation_batch(
     db_path: &Path,
     access_db_path: &Path,
-    graph_path: &Path,
     project_id: Option<String>,
     embedder: Arc<crate::Embedder>,
 ) -> Result<()> {
@@ -178,10 +175,8 @@ async fn run_consolidation_batch(
         .await
         .map_err(|e| SedimentError::Database(format!("Consolidation DB open failed: {}", e)))?;
 
-    let graph = crate::graph::GraphStore::open(graph_path)?;
-
     for candidate in &candidates {
-        let result = process_candidate(&mut db, &graph, candidate).await;
+        let result = process_candidate(&mut db, access_db_path, candidate).await;
         match result {
             Ok(status) => {
                 let _ = queue.mark_processed(&candidate.item_id_a, &candidate.item_id_b, &status);
@@ -206,9 +201,10 @@ async fn run_consolidation_batch(
 /// Returns the status string ("merged" or "linked").
 async fn process_candidate(
     db: &mut crate::Database,
-    graph: &crate::graph::GraphStore,
+    graph_db_path: &Path,
     candidate: &ConsolidationCandidate,
 ) -> Result<String> {
+    let graph = crate::graph::GraphStore::open(graph_db_path)?;
     if candidate.similarity >= 0.95 {
         // Near-duplicate: newer absorbs older
         let item_a = db.get_item(&candidate.item_id_a).await?;

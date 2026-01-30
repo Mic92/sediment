@@ -1,11 +1,11 @@
-//! Graph store using Kuzu for relationship tracking between memories.
+//! Graph store using SQLite for relationship tracking between memories.
 //!
-//! Provides a property graph layer alongside LanceDB for tracking
+//! Provides a graph layer alongside LanceDB for tracking
 //! relationships like RELATED, SUPERSEDES, and CO_ACCESSED between items.
 
 use std::path::Path;
 
-use kuzu::{Connection, Database, SystemConfig, Value};
+use rusqlite::{Connection, params};
 use tracing::debug;
 
 use crate::error::{Result, SedimentError};
@@ -34,116 +34,60 @@ pub struct ConnectionInfo {
     pub count: Option<i64>,
 }
 
-/// Kuzu graph store for memory relationships.
+/// SQLite-backed graph store for memory relationships.
 pub struct GraphStore {
-    db: Database,
+    conn: Connection,
 }
 
 impl GraphStore {
-    /// Open or create a graph database at the given path.
-    /// Creates the schema lazily on first access.
+    /// Open or create the graph store using the given SQLite database path.
+    /// Shares the same file as access.db.
     pub fn open(path: &Path) -> Result<Self> {
-        std::fs::create_dir_all(path).map_err(|e| {
-            SedimentError::Database(format!("Failed to create graph directory: {}", e))
+        let conn = Connection::open(path).map_err(|e| {
+            SedimentError::Database(format!("Failed to open graph database: {}", e))
         })?;
 
-        let db = Database::new(
-            path.to_str().unwrap_or_default(),
-            SystemConfig::default(),
+        conn.execute_batch("PRAGMA journal_mode=WAL;").ok();
+
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS graph_nodes (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS graph_edges (
+                from_id TEXT NOT NULL,
+                to_id TEXT NOT NULL,
+                edge_type TEXT NOT NULL,
+                strength REAL NOT NULL DEFAULT 0.0,
+                rel_type TEXT NOT NULL DEFAULT '',
+                count INTEGER NOT NULL DEFAULT 0,
+                last_at INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                UNIQUE(from_id, to_id, edge_type)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_edges_from ON graph_edges(from_id);
+            CREATE INDEX IF NOT EXISTS idx_edges_to ON graph_edges(to_id);",
         )
-        .map_err(|e| SedimentError::Database(format!("Failed to open graph database: {}", e)))?;
+        .map_err(|e| {
+            SedimentError::Database(format!("Failed to create graph tables: {}", e))
+        })?;
 
-        let store = Self { db };
-        store.ensure_schema()?;
-        Ok(store)
-    }
-
-    /// Create a new connection to the graph database.
-    fn conn(&self) -> Result<Connection<'_>> {
-        Connection::new(&self.db)
-            .map_err(|e| SedimentError::Database(format!("Failed to create graph connection: {}", e)))
-    }
-
-    /// Ensure all required node and edge tables exist.
-    fn ensure_schema(&self) -> Result<()> {
-        let conn = self.conn()?;
-
-        // Create Memory node table if not exists
-        let _ = conn.query(
-            "CREATE NODE TABLE IF NOT EXISTS Memory (
-                id STRING,
-                project_id STRING,
-                created_at INT64,
-                PRIMARY KEY(id)
-            )"
-        );
-
-        // Create RELATED relationship table if not exists
-        let _ = conn.query(
-            "CREATE REL TABLE IF NOT EXISTS RELATED (
-                FROM Memory TO Memory,
-                strength DOUBLE,
-                rel_type STRING,
-                created_at INT64
-            )"
-        );
-
-        // Create SUPERSEDES relationship table if not exists
-        let _ = conn.query(
-            "CREATE REL TABLE IF NOT EXISTS SUPERSEDES (
-                FROM Memory TO Memory,
-                created_at INT64
-            )"
-        );
-
-        // Create CO_ACCESSED relationship table if not exists
-        let _ = conn.query(
-            "CREATE REL TABLE IF NOT EXISTS CO_ACCESSED (
-                FROM Memory TO Memory,
-                count INT64,
-                last_at INT64
-            )"
-        );
-
-        // Create CLUSTER_SIBLING relationship table if not exists
-        let _ = conn.query(
-            "CREATE REL TABLE IF NOT EXISTS CLUSTER_SIBLING (
-                FROM Memory TO Memory,
-                cluster_label STRING,
-                created_at INT64
-            )"
-        );
-
-        Ok(())
+        Ok(Self { conn })
     }
 
     /// Add a Memory node to the graph.
     pub fn add_node(&self, id: &str, project_id: Option<&str>, created_at: i64) -> Result<()> {
-        let conn = self.conn()?;
         let pid = project_id.unwrap_or("");
 
-        let mut stmt = conn.prepare(
-            "CREATE (m:Memory {id: $id, project_id: $pid, created_at: $ts})"
-        ).map_err(|e| SedimentError::Database(format!("Failed to prepare add_node: {}", e)))?;
-
-        let result = conn.execute(&mut stmt, vec![
-            ("id", Value::String(id.to_string())),
-            ("pid", Value::String(pid.to_string())),
-            ("ts", Value::Int64(created_at)),
-        ]);
-
-        match result {
-            Ok(_) => {}
-            Err(e) => {
-                let msg = format!("{}", e);
-                // Ignore duplicate key errors (node already exists)
-                if msg.contains("already exists") || msg.contains("duplicate") || msg.contains("PRIMARY KEY") || msg.contains("Violates primary key") {
-                    debug!("Node {} already exists in graph", id);
-                } else {
-                    return Err(SedimentError::Database(format!("Failed to add node: {}", e)));
-                }
-            }
-        }
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO graph_nodes (id, project_id, created_at) VALUES (?1, ?2, ?3)",
+                params![id, pid, created_at],
+            )
+            .map_err(|e| SedimentError::Database(format!("Failed to add node: {}", e)))?;
 
         debug!("Added graph node: {}", id);
         Ok(())
@@ -151,35 +95,21 @@ impl GraphStore {
 
     /// Ensure a node exists in the graph. Creates it if missing (for backfill).
     pub fn ensure_node_exists(&self, id: &str, project_id: Option<&str>, created_at: i64) -> Result<()> {
-        let conn = self.conn()?;
-
-        // Check if node exists
-        let mut stmt = conn.prepare(
-            "MATCH (m:Memory {id: $id}) RETURN m.id"
-        ).map_err(|e| SedimentError::Database(format!("Failed to prepare check: {}", e)))?;
-
-        let result = conn.execute(&mut stmt, vec![
-            ("id", Value::String(id.to_string())),
-        ]).map_err(|e| SedimentError::Database(format!("Failed to check node: {}", e)))?;
-
-        if result.get_num_tuples() == 0 {
-            self.add_node(id, project_id, created_at)?;
-        }
-
-        Ok(())
+        self.add_node(id, project_id, created_at)
     }
 
     /// Remove a Memory node and all its edges from the graph.
     pub fn remove_node(&self, id: &str) -> Result<()> {
-        let conn = self.conn()?;
+        self.conn
+            .execute(
+                "DELETE FROM graph_edges WHERE from_id = ?1 OR to_id = ?1",
+                params![id],
+            )
+            .map_err(|e| SedimentError::Database(format!("Failed to remove edges: {}", e)))?;
 
-        let mut stmt = conn.prepare(
-            "MATCH (m:Memory {id: $id}) DETACH DELETE m"
-        ).map_err(|e| SedimentError::Database(format!("Failed to prepare remove_node: {}", e)))?;
-
-        conn.execute(&mut stmt, vec![
-            ("id", Value::String(id.to_string())),
-        ]).map_err(|e| SedimentError::Database(format!("Failed to remove node: {}", e)))?;
+        self.conn
+            .execute("DELETE FROM graph_nodes WHERE id = ?1", params![id])
+            .map_err(|e| SedimentError::Database(format!("Failed to remove node: {}", e)))?;
 
         debug!("Removed graph node: {}", id);
         Ok(())
@@ -187,21 +117,15 @@ impl GraphStore {
 
     /// Add a RELATED edge between two Memory nodes.
     pub fn add_related_edge(&self, from_id: &str, to_id: &str, strength: f64, rel_type: &str) -> Result<()> {
-        let conn = self.conn()?;
         let now = chrono::Utc::now().timestamp();
 
-        let mut stmt = conn.prepare(
-            "MATCH (a:Memory {id: $from_id}), (b:Memory {id: $to_id})
-             CREATE (a)-[:RELATED {strength: $str, rel_type: $rt, created_at: $ts}]->(b)"
-        ).map_err(|e| SedimentError::Database(format!("Failed to prepare add_edge: {}", e)))?;
-
-        conn.execute(&mut stmt, vec![
-            ("from_id", Value::String(from_id.to_string())),
-            ("to_id", Value::String(to_id.to_string())),
-            ("str", Value::Double(strength)),
-            ("rt", Value::String(rel_type.to_string())),
-            ("ts", Value::Int64(now)),
-        ]).map_err(|e| SedimentError::Database(format!("Failed to add related edge: {}", e)))?;
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO graph_edges (from_id, to_id, edge_type, strength, rel_type, created_at)
+                 VALUES (?1, ?2, 'related', ?3, ?4, ?5)",
+                params![from_id, to_id, strength, rel_type, now],
+            )
+            .map_err(|e| SedimentError::Database(format!("Failed to add related edge: {}", e)))?;
 
         debug!("Added RELATED edge: {} -> {} ({})", from_id, to_id, rel_type);
         Ok(())
@@ -209,19 +133,15 @@ impl GraphStore {
 
     /// Add a SUPERSEDES edge from new_id to old_id.
     pub fn add_supersedes_edge(&self, new_id: &str, old_id: &str) -> Result<()> {
-        let conn = self.conn()?;
         let now = chrono::Utc::now().timestamp();
 
-        let mut stmt = conn.prepare(
-            "MATCH (a:Memory {id: $new_id}), (b:Memory {id: $old_id})
-             CREATE (a)-[:SUPERSEDES {created_at: $ts}]->(b)"
-        ).map_err(|e| SedimentError::Database(format!("Failed to prepare supersedes edge: {}", e)))?;
-
-        conn.execute(&mut stmt, vec![
-            ("new_id", Value::String(new_id.to_string())),
-            ("old_id", Value::String(old_id.to_string())),
-            ("ts", Value::Int64(now)),
-        ]).map_err(|e| SedimentError::Database(format!("Failed to add supersedes edge: {}", e)))?;
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO graph_edges (from_id, to_id, edge_type, strength, created_at)
+                 VALUES (?1, ?2, 'supersedes', 1.0, ?3)",
+                params![new_id, old_id, now],
+            )
+            .map_err(|e| SedimentError::Database(format!("Failed to add supersedes edge: {}", e)))?;
 
         debug!("Added SUPERSEDES edge: {} -> {}", new_id, old_id);
         Ok(())
@@ -234,47 +154,47 @@ impl GraphStore {
             return Ok(Vec::new());
         }
 
-        let conn = self.conn()?;
-        let mut results = Vec::new();
+        let placeholders: Vec<String> = (1..=ids.len()).map(|i| format!("?{}", i)).collect();
+        let ph = placeholders.join(",");
+        let strength_idx = ids.len() + 1;
 
+        let sql = format!(
+            "SELECT
+                CASE WHEN from_id IN ({ph}) THEN to_id ELSE from_id END AS neighbor,
+                CASE WHEN edge_type = 'related' THEN rel_type ELSE 'supersedes' END AS rtype,
+                strength
+             FROM graph_edges
+             WHERE (from_id IN ({ph}) OR to_id IN ({ph}))
+               AND edge_type IN ('related', 'supersedes')
+               AND strength >= ?{strength_idx}"
+        );
+
+        let mut stmt = self.conn.prepare(&sql).map_err(|e| {
+            SedimentError::Database(format!("Failed to prepare neighbors query: {}", e))
+        })?;
+
+        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         for id in ids {
-            // Query RELATED edges
-            let mut stmt = conn.prepare(
-                "MATCH (a:Memory {id: $id})-[r:RELATED]-(b:Memory)
-                 WHERE r.strength >= $min_str
-                 RETURN b.id, r.rel_type, r.strength"
-            ).map_err(|e| SedimentError::Database(format!("Failed to prepare neighbors query: {}", e)))?;
+            param_values.push(Box::new(id.to_string()));
+        }
+        param_values.push(Box::new(min_strength));
 
-            let result = conn.execute(&mut stmt, vec![
-                ("id", Value::String(id.to_string())),
-                ("min_str", Value::Double(min_strength)),
-            ]).map_err(|e| SedimentError::Database(format!("Failed to query neighbors: {}", e)))?;
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> = param_values.iter().map(|b| b.as_ref()).collect();
 
-            for row in result {
-                if let (Some(bid), Some(rt), Some(str_val)) = (
-                    extract_string(&row, 0),
-                    extract_string(&row, 1),
-                    extract_double(&row, 2),
-                ) {
-                    results.push((bid, rt, str_val));
-                }
-            }
+        let rows = stmt
+            .query_map(params_ref.as_slice(), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, f64>(2)?,
+                ))
+            })
+            .map_err(|e| SedimentError::Database(format!("Failed to query neighbors: {}", e)))?;
 
-            // Query SUPERSEDES edges
-            let mut stmt2 = conn.prepare(
-                "MATCH (a:Memory {id: $id})-[r:SUPERSEDES]-(b:Memory)
-                 RETURN b.id, 'supersedes', 1.0"
-            ).map_err(|e| SedimentError::Database(format!("Failed to prepare supersedes query: {}", e)))?;
-
-            let result2 = conn.execute(&mut stmt2, vec![
-                ("id", Value::String(id.to_string())),
-            ]).map_err(|e| SedimentError::Database(format!("Failed to query supersedes: {}", e)))?;
-
-            for row in result2 {
-                if let Some(bid) = extract_string(&row, 0) {
-                    results.push((bid, "supersedes".to_string(), 1.0));
-                }
-            }
+        let mut results = Vec::new();
+        for row in rows {
+            let r = row.map_err(|e| SedimentError::Database(format!("Failed to read neighbor: {}", e)))?;
+            results.push(r);
         }
 
         Ok(results)
@@ -287,7 +207,6 @@ impl GraphStore {
             return Ok(());
         }
 
-        let conn = self.conn()?;
         let now = chrono::Utc::now().timestamp();
 
         for i in 0..item_ids.len() {
@@ -295,32 +214,17 @@ impl GraphStore {
                 let a = &item_ids[i];
                 let b = &item_ids[j];
 
-                // Try to increment existing edge
-                let mut stmt = conn.prepare(
-                    "MATCH (a:Memory {id: $a_id})-[r:CO_ACCESSED]->(b:Memory {id: $b_id})
-                     SET r.count = r.count + 1, r.last_at = $now
-                     RETURN r.count"
-                ).map_err(|e| SedimentError::Database(format!("Failed to prepare co-access update: {}", e)))?;
-
-                let result = conn.execute(&mut stmt, vec![
-                    ("a_id", Value::String(a.clone())),
-                    ("b_id", Value::String(b.clone())),
-                    ("now", Value::Int64(now)),
-                ]).map_err(|e| SedimentError::Database(format!("Failed to update co-access: {}", e)))?;
-
-                if result.get_num_tuples() == 0 {
-                    // No existing edge, create one
-                    let mut create_stmt = conn.prepare(
-                        "MATCH (a:Memory {id: $a_id}), (b:Memory {id: $b_id})
-                         CREATE (a)-[:CO_ACCESSED {count: 1, last_at: $now}]->(b)"
-                    ).map_err(|e| SedimentError::Database(format!("Failed to prepare co-access create: {}", e)))?;
-
-                    let _ = conn.execute(&mut create_stmt, vec![
-                        ("a_id", Value::String(a.clone())),
-                        ("b_id", Value::String(b.clone())),
-                        ("now", Value::Int64(now)),
-                    ]);
-                }
+                self.conn
+                    .execute(
+                        "INSERT INTO graph_edges (from_id, to_id, edge_type, count, last_at, created_at)
+                         VALUES (?1, ?2, 'co_accessed', 1, ?3, ?3)
+                         ON CONFLICT(from_id, to_id, edge_type)
+                         DO UPDATE SET count = count + 1, last_at = ?3",
+                        params![a, b, now],
+                    )
+                    .map_err(|e| {
+                        SedimentError::Database(format!("Failed to record co-access: {}", e))
+                    })?;
             }
         }
 
@@ -334,27 +238,43 @@ impl GraphStore {
             return Ok(Vec::new());
         }
 
-        let conn = self.conn()?;
-        let mut results = Vec::new();
+        let placeholders: Vec<String> = (1..=ids.len()).map(|i| format!("?{}", i)).collect();
+        let ph = placeholders.join(",");
+        let min_idx = ids.len() + 1;
 
+        let sql = format!(
+            "SELECT
+                CASE WHEN from_id IN ({ph}) THEN to_id ELSE from_id END AS neighbor,
+                count
+             FROM graph_edges
+             WHERE (from_id IN ({ph}) OR to_id IN ({ph}))
+               AND edge_type = 'co_accessed'
+               AND count >= ?{min_idx}
+             ORDER BY count DESC"
+        );
+
+        let mut stmt = self.conn.prepare(&sql).map_err(|e| {
+            SedimentError::Database(format!("Failed to prepare co-access query: {}", e))
+        })?;
+
+        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         for id in ids {
-            let mut stmt = conn.prepare(
-                "MATCH (a:Memory {id: $id})-[r:CO_ACCESSED]-(b:Memory)
-                 WHERE r.count >= $min_count
-                 RETURN b.id, r.count
-                 ORDER BY r.count DESC"
-            ).map_err(|e| SedimentError::Database(format!("Failed to prepare co-access query: {}", e)))?;
+            param_values.push(Box::new(id.to_string()));
+        }
+        param_values.push(Box::new(min_count));
 
-            let result = conn.execute(&mut stmt, vec![
-                ("id", Value::String(id.to_string())),
-                ("min_count", Value::Int64(min_count)),
-            ]).map_err(|e| SedimentError::Database(format!("Failed to query co-access: {}", e)))?;
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> = param_values.iter().map(|b| b.as_ref()).collect();
 
-            for row in result {
-                if let (Some(bid), Some(count)) = (extract_string(&row, 0), extract_i64(&row, 1)) {
-                    results.push((bid, count));
-                }
-            }
+        let rows = stmt
+            .query_map(params_ref.as_slice(), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(|e| SedimentError::Database(format!("Failed to query co-access: {}", e)))?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            let r = row.map_err(|e| SedimentError::Database(format!("Failed to read co-access: {}", e)))?;
+            results.push(r);
         }
 
         // Deduplicate by target_id, keeping highest count
@@ -367,35 +287,29 @@ impl GraphStore {
 
     /// Transfer all edges from one node to another (used during consolidation merge).
     pub fn transfer_edges(&self, from_id: &str, to_id: &str) -> Result<()> {
-        let conn = self.conn()?;
-
-        // Get all RELATED edges from the old node
-        let mut stmt = conn.prepare(
-            "MATCH (a:Memory {id: $from_id})-[r:RELATED]-(b:Memory)
-             WHERE b.id <> $to_id
-             RETURN b.id, r.strength, r.rel_type, r.created_at"
+        // Get all RELATED edges connected to from_id (excluding edges to to_id)
+        let mut stmt = self.conn.prepare(
+            "SELECT from_id, to_id, strength, rel_type, created_at
+             FROM graph_edges
+             WHERE (from_id = ?1 OR to_id = ?1)
+               AND edge_type = 'related'
+               AND from_id != ?2 AND to_id != ?2"
         ).map_err(|e| SedimentError::Database(format!("Failed to prepare transfer query: {}", e)))?;
 
-        let result = conn.execute(&mut stmt, vec![
-            ("from_id", Value::String(from_id.to_string())),
-            ("to_id", Value::String(to_id.to_string())),
-        ]).map_err(|e| SedimentError::Database(format!("Failed to query edges for transfer: {}", e)))?;
-
-        let mut edges_to_create: Vec<(String, f64, String, i64)> = Vec::new();
-        for row in result {
-            if let (Some(bid), Some(str_val), Some(rt), Some(ts)) = (
-                extract_string(&row, 0),
-                extract_double(&row, 1),
-                extract_string(&row, 2),
-                extract_i64(&row, 3),
-            ) {
-                edges_to_create.push((bid, str_val, rt, ts));
-            }
-        }
+        let edges: Vec<(String, f64, String, i64)> = stmt
+            .query_map(params![from_id, to_id], |row| {
+                let fid: String = row.get(0)?;
+                let tid: String = row.get(1)?;
+                let neighbor = if fid == from_id { tid } else { fid };
+                Ok((neighbor, row.get(2)?, row.get(3)?, row.get(4)?))
+            })
+            .map_err(|e| SedimentError::Database(format!("Failed to query edges for transfer: {}", e)))?
+            .filter_map(|r| r.ok())
+            .collect();
 
         // Create edges on the new node
-        for (bid, strength, rel_type, _) in &edges_to_create {
-            let _ = self.add_related_edge(to_id, bid, *strength, rel_type);
+        for (neighbor, strength, rel_type, _) in &edges {
+            let _ = self.add_related_edge(to_id, neighbor, *strength, rel_type);
         }
 
         Ok(())
@@ -404,23 +318,29 @@ impl GraphStore {
     /// Detect triangles of RELATED items (for clustering).
     /// Returns sets of 3 item IDs that form triangles.
     pub fn detect_clusters(&self) -> Result<Vec<(String, String, String)>> {
-        let conn = self.conn()?;
-
-        let result = conn.query(
-            "MATCH (a:Memory)-[:RELATED]-(b:Memory)-[:RELATED]-(c:Memory)-[:RELATED]-(a)
-             WHERE a.id < b.id AND b.id < c.id
-             RETURN a.id, b.id, c.id
+        let mut stmt = self.conn.prepare(
+            "SELECT e1.from_id, e1.to_id, e2.to_id
+             FROM graph_edges e1
+             JOIN graph_edges e2 ON e1.to_id = e2.from_id AND e1.edge_type = 'related' AND e2.edge_type = 'related'
+             JOIN graph_edges e3 ON e2.to_id = e3.to_id AND e3.from_id = e1.from_id AND e3.edge_type = 'related'
+             WHERE e1.from_id < e1.to_id AND e1.to_id < e2.to_id
              LIMIT 50"
         ).map_err(|e| SedimentError::Database(format!("Failed to detect clusters: {}", e)))?;
 
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|e| SedimentError::Database(format!("Failed to read clusters: {}", e)))?;
+
         let mut clusters = Vec::new();
-        for row in result {
-            if let (Some(a), Some(b), Some(c)) = (
-                extract_string(&row, 0),
-                extract_string(&row, 1),
-                extract_string(&row, 2),
-            ) {
-                clusters.push((a, b, c));
+        for row in rows {
+            if let Ok(r) = row {
+                clusters.push(r);
             }
         }
 
@@ -429,74 +349,49 @@ impl GraphStore {
 
     /// Get full connection info for an item (all edge types).
     pub fn get_full_connections(&self, item_id: &str) -> Result<Vec<ConnectionInfo>> {
-        let conn = self.conn()?;
-        let mut connections = Vec::new();
-
-        // RELATED edges
-        let mut stmt = conn.prepare(
-            "MATCH (a:Memory {id: $id})-[r:RELATED]-(b:Memory)
-             RETURN b.id, r.rel_type, r.strength"
+        let mut stmt = self.conn.prepare(
+            "SELECT
+                CASE WHEN from_id = ?1 THEN to_id ELSE from_id END AS neighbor,
+                edge_type,
+                strength,
+                rel_type,
+                count
+             FROM graph_edges
+             WHERE from_id = ?1 OR to_id = ?1"
         ).map_err(|e| SedimentError::Database(format!("Failed to prepare connections query: {}", e)))?;
 
-        let result = conn.execute(&mut stmt, vec![
-            ("id", Value::String(item_id.to_string())),
-        ]).map_err(|e| SedimentError::Database(format!("Failed to query connections: {}", e)))?;
+        let rows = stmt
+            .query_map(params![item_id], |row| {
+                let neighbor: String = row.get(0)?;
+                let edge_type: String = row.get(1)?;
+                let strength: f64 = row.get(2)?;
+                let rel_type_val: String = row.get(3)?;
+                let count: i64 = row.get(4)?;
 
-        for row in result {
-            if let (Some(bid), Some(rt), Some(str_val)) = (
-                extract_string(&row, 0),
-                extract_string(&row, 1),
-                extract_double(&row, 2),
-            ) {
-                connections.push(ConnectionInfo {
-                    target_id: bid,
-                    rel_type: rt,
-                    strength: str_val,
-                    count: None,
-                });
-            }
-        }
+                let display_type = match edge_type.as_str() {
+                    "related" => rel_type_val.clone(),
+                    "supersedes" => "supersedes".to_string(),
+                    "co_accessed" => "co_accessed".to_string(),
+                    _ => edge_type.clone(),
+                };
 
-        // SUPERSEDES edges
-        let mut stmt2 = conn.prepare(
-            "MATCH (a:Memory {id: $id})-[r:SUPERSEDES]-(b:Memory)
-             RETURN b.id"
-        ).map_err(|e| SedimentError::Database(format!("Failed to prepare supersedes query: {}", e)))?;
+                Ok(ConnectionInfo {
+                    target_id: neighbor,
+                    rel_type: display_type,
+                    strength,
+                    count: if edge_type == "co_accessed" {
+                        Some(count)
+                    } else {
+                        None
+                    },
+                })
+            })
+            .map_err(|e| SedimentError::Database(format!("Failed to query connections: {}", e)))?;
 
-        let result2 = conn.execute(&mut stmt2, vec![
-            ("id", Value::String(item_id.to_string())),
-        ]).map_err(|e| SedimentError::Database(format!("Failed to query supersedes: {}", e)))?;
-
-        for row in result2 {
-            if let Some(bid) = extract_string(&row, 0) {
-                connections.push(ConnectionInfo {
-                    target_id: bid,
-                    rel_type: "supersedes".to_string(),
-                    strength: 1.0,
-                    count: None,
-                });
-            }
-        }
-
-        // CO_ACCESSED edges
-        let mut stmt3 = conn.prepare(
-            "MATCH (a:Memory {id: $id})-[r:CO_ACCESSED]-(b:Memory)
-             RETURN b.id, r.count"
-        ).map_err(|e| SedimentError::Database(format!("Failed to prepare co-access query: {}", e)))?;
-
-        let result3 = conn.execute(&mut stmt3, vec![
-            ("id", Value::String(item_id.to_string())),
-        ]).map_err(|e| SedimentError::Database(format!("Failed to query co-access: {}", e)))?;
-
-        for row in result3 {
-            if let (Some(bid), Some(count)) = (extract_string(&row, 0), extract_i64(&row, 1)) {
-                connections.push(ConnectionInfo {
-                    target_id: bid,
-                    rel_type: "co_accessed".to_string(),
-                    strength: 0.0,
-                    count: Some(count),
-                });
-            }
+        let mut connections = Vec::new();
+        for row in rows {
+            let r = row.map_err(|e| SedimentError::Database(format!("Failed to read connection: {}", e)))?;
+            connections.push(r);
         }
 
         Ok(connections)
@@ -504,32 +399,14 @@ impl GraphStore {
 
     /// Get the edge count for an item (total number of edges of all types).
     pub fn get_edge_count(&self, item_id: &str) -> Result<u32> {
-        let conns = self.get_full_connections(item_id)?;
-        Ok(conns.len() as u32)
+        let count: i64 = self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM graph_edges WHERE from_id = ?1 OR to_id = ?1",
+                params![item_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| SedimentError::Database(format!("Failed to count edges: {}", e)))?;
+
+        Ok(count as u32)
     }
-}
-
-// ==================== Value extraction helpers ====================
-
-fn extract_string(row: &[Value], idx: usize) -> Option<String> {
-    row.get(idx).and_then(|v| match v {
-        Value::String(s) => Some(s.clone()),
-        _ => None,
-    })
-}
-
-fn extract_double(row: &[Value], idx: usize) -> Option<f64> {
-    row.get(idx).and_then(|v| match v {
-        Value::Double(d) => Some(*d),
-        Value::Float(f) => Some(*f as f64),
-        _ => None,
-    })
-}
-
-fn extract_i64(row: &[Value], idx: usize) -> Option<i64> {
-    row.get(idx).and_then(|v| match v {
-        Value::Int64(i) => Some(*i),
-        Value::Int32(i) => Some(*i as i64),
-        _ => None,
-    })
 }

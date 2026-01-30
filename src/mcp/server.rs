@@ -23,8 +23,6 @@ pub struct ServerContext {
     pub db_path: PathBuf,
     /// Path to the access tracking SQLite database
     pub access_db_path: PathBuf,
-    /// Path to the Kuzu graph database directory
-    pub graph_path: PathBuf,
     /// Optional project ID for scoped operations
     pub project_id: Option<String>,
     /// Shared embedder instance (expensive to create, loaded once)
@@ -52,7 +50,6 @@ pub fn run(db_path: &Path, project_id: Option<String>) -> Result<()> {
         .parent()
         .unwrap_or(db_path);
     let access_db_path = sediment_dir.join("access.db");
-    let graph_path = sediment_dir.join("graph");
 
     // Get current working directory
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -61,7 +58,6 @@ pub fn run(db_path: &Path, project_id: Option<String>) -> Result<()> {
     let ctx = ServerContext {
         db_path: db_path.to_path_buf(),
         access_db_path,
-        graph_path,
         project_id,
         embedder,
         cwd,

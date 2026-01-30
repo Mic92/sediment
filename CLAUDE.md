@@ -29,7 +29,13 @@ cargo install --path .
 
 ## Architecture
 
-Sediment is a semantic memory system for AI agents, running as an MCP (Model Context Protocol) server.
+Sediment is a semantic memory system for AI agents, running as an MCP (Model Context Protocol) server. It combines vector search, a property graph, and access tracking into a unified memory intelligence layer.
+
+### Three-Database Hybrid (all local, embedded, zero config)
+
+- **LanceDB** — Vector embeddings + semantic similarity (items and chunks)
+- **Kuzu** — Property graph for relationships, traversal, pattern discovery
+- **SQLite** — Mutable counters: access tracking, decay scoring, consolidation queue, validation counts
 
 ### Core Components
 
@@ -38,43 +44,98 @@ Sediment is a semantic memory system for AI agents, running as an MCP (Model Con
 - **`src/db.rs`** - LanceDB wrapper handling vector storage, search, and CRUD operations
 - **`src/embedder.rs`** - Local embeddings using `all-MiniLM-L6-v2` via Candle (384-dim vectors)
 - **`src/chunker.rs`** - Smart content chunking by type (markdown, code, JSON, YAML, text)
-- **`src/access.rs`** - SQLite-based access tracking for memory decay scoring
+- **`src/access.rs`** - SQLite-based access tracking, validation counting, and memory decay scoring
+- **`src/graph.rs`** - Kuzu graph store: relationship tracking (RELATED, SUPERSEDES, CO_ACCESSED, CLUSTER_SIBLING edges)
+- **`src/consolidation.rs`** - Background consolidation: auto-merging near-duplicates, linking similar items
 
 ### MCP Server (`src/mcp/`)
 
 - **`mod.rs`** - Module exports
-- **`server.rs`** - stdio JSON-RPC server implementation with shared embedder context
-- **`tools.rs`** - 4 MCP tools: `store`, `recall`, `list`, `forget`
+- **`server.rs`** - stdio JSON-RPC server with shared embedder, graph path, consolidation semaphore
+- **`tools.rs`** - 5 MCP tools: `store`, `recall`, `list`, `forget`, `connections`
 - **`protocol.rs`** - MCP protocol types and JSON-RPC handling
 
 ### Data Flow
 
-1. Content → Embedder (generates 384-dim vector) → LanceDB storage
-2. Long content (>1000 chars) → Chunker (type-aware splitting) → Individual chunk embeddings
-3. Search queries → Embedder → Vector similarity search on both items and chunks → Boosted by project context → Decay-scored by freshness and access frequency
+1. **Store**: Content → Embedder (384-dim vector) → LanceDB storage → Kuzu node creation → Provenance metadata injection → Conflict detection → Consolidation queue → Auto-tag inference
+2. **Chunking**: Long content (>1000 chars) → Type-aware splitting → Individual chunk embeddings
+3. **Recall**: Query → Embedder → Vector similarity search → Project boosting → Decay scoring → Trust-weighted re-ranking → Graph backfill → 1-hop graph expansion → Co-access suggestions → Cross-project flagging → Background consolidation + co-access recording
+4. **Consolidation** (background): Queue candidates → >=0.95 similarity: merge (delete old, transfer edges, SUPERSEDES edge) → 0.85-0.95: link (RELATED edge)
+5. **Clustering** (periodic): Triangle detection in graph → CLUSTER_SIBLING edges
 
 ### Key Design Decisions
 
-- **Single central database** at `~/.sediment/data/` stores all projects
+- **Three-database hybrid**: LanceDB for vectors, Kuzu for relationships, SQLite for mutable counters
+- **Single central database** at `~/.sediment/data/` stores all projects; graph at `~/.sediment/graph/`
 - **Project scoping** via UUID stored in `.sediment/config` per project
 - **Similarity boosting**: Same-project items get 1.15x boost, different projects 0.95x penalty
-- **Conflict detection**: Items with >=0.85 similarity flagged on store
+- **Conflict detection**: Items with >=0.85 similarity flagged on store and enqueued for consolidation
 - **Fresh DB connection per tool call** with shared embedder for efficiency
-- **Memory decay scoring**: Recall results are re-ranked using freshness (30-day half-life) and access frequency (log-scaled). Tracked in a SQLite sidecar (`~/.sediment/access.db`) since LanceDB is append-oriented. Old memories are demoted in ranking but never auto-deleted.
+- **Memory decay scoring**: Recall results re-ranked using freshness (30-day half-life) and access frequency (log-scaled). Tracked in SQLite sidecar since LanceDB is append-oriented.
+- **Trust-weighted scoring**: `final_score = similarity * freshness * frequency * trust_bonus` where `trust_bonus = 1.0 + 0.05*ln(1+validation_count) + 0.02*edge_count`
+- **Non-blocking intelligence**: All background tasks (consolidation, co-access tracking, clustering) run as fire-and-forget `tokio::spawn` tasks. Tool responses return immediately. `Semaphore(1)` prevents concurrent consolidation.
+- **Auto-provenance**: Every store injects `metadata._provenance` with version, project_path, and supersedes chain
+- **Lazy graph backfill**: Pre-existing items get Kuzu nodes when they appear in recall results
+- **Auto-tagging**: Items stored without tags inherit `auto:` prefixed tags from 2+ similar items sharing the same tag
 
 ## MCP Tools Reference
 
-When working on tools, the 4-tool API is defined in `src/mcp/tools.rs`:
+The 5-tool API is defined in `src/mcp/tools.rs`:
 
 | Tool | Purpose |
 |------|---------|
-| `store` | Store content with optional title, tags, metadata, expiration, scope |
-| `recall` | Semantic search with similarity threshold and tag filtering |
+| `store` | Store content with optional title, tags, metadata, expiration, scope, replace, related |
+| `recall` | Semantic search with decay scoring, trust weighting, graph expansion, co-access suggestions, cross-project flagging |
 | `list` | List items by scope (project/global/all) with tag filtering |
-| `forget` | Delete item by ID |
+| `forget` | Delete item by ID (removes from LanceDB and Kuzu graph) |
+| `connections` | Show full relationship graph for an item (RELATED, SUPERSEDES, CO_ACCESSED edges with content previews) |
+
+### Store Parameters
+- `content` (required), `title`, `tags`, `source`, `metadata`, `expires_at`, `scope` (project/global), `replace` (atomically replace item by ID), `related` (array of item IDs to link in graph)
+
+### Recall Response Fields
+- `results[]` — standard results with `similarity`, `related_ids`, optional `cross_project` + `project_path` flags
+- `graph_expanded[]` — 1-hop neighbors from graph not in original results (marked `graph_expanded: true`)
+- `suggested[]` — items frequently co-recalled with top results (co-access count >= 3)
+
+### Connections Response
+- `item_id`, `connections[]` — each with `id`, `type` (related/supersedes/co_accessed), `strength`, optional `count`, `content_preview`
+
+## Graph Schema (Kuzu)
+
+```
+NODE TABLE Memory (id STRING PRIMARY KEY, project_id STRING, created_at INT64)
+
+REL TABLE RELATED (FROM Memory TO Memory, strength DOUBLE, rel_type STRING, created_at INT64)
+REL TABLE SUPERSEDES (FROM Memory TO Memory, created_at INT64)
+REL TABLE CO_ACCESSED (FROM Memory TO Memory, count INT64, last_at INT64)
+REL TABLE CLUSTER_SIBLING (FROM Memory TO Memory, cluster_label STRING, created_at INT64)
+```
+
+## SQLite Schema (access.db)
+
+```sql
+-- Access tracking and decay scoring
+CREATE TABLE access_log (
+    item_id TEXT PRIMARY KEY,
+    access_count INTEGER DEFAULT 0,
+    last_accessed_at INTEGER,
+    created_at INTEGER,
+    validation_count INTEGER DEFAULT 0  -- incremented on replace
+);
+
+-- Consolidation queue (populated on store conflicts)
+CREATE TABLE consolidation_queue (
+    item_id_a TEXT, item_id_b TEXT, similarity REAL,
+    status TEXT DEFAULT 'pending',  -- pending/merged/linked
+    created_at INTEGER,
+    UNIQUE(item_id_a, item_id_b)
+);
+```
 
 ## Testing Notes
 
 - Embedder tests are marked `#[ignore]` because they require downloading the model (~90MB)
 - Use `tempfile` crate for database tests to avoid polluting real data
 - LanceDB operations are async; tests use `tokio::runtime::Runtime`
+- Kuzu requires `cxx-build = "=1.0.138"` pinned in build-dependencies to match kuzu's pinned `cxx = "=1.0.138"` (version mismatch causes linker errors)
