@@ -34,8 +34,8 @@ Sediment is a semantic memory system for AI agents, running as an MCP (Model Con
 ### Three-Database Hybrid (all local, embedded, zero config)
 
 - **LanceDB** — Vector embeddings + semantic similarity (items and chunks)
-- **Kuzu** — Property graph for relationships, traversal, pattern discovery
-- **SQLite** — Mutable counters: access tracking, decay scoring, consolidation queue, validation counts
+- **SQLite** (graph) — Relationship tracking: RELATED, SUPERSEDES, CO_ACCESSED, CLUSTER_SIBLING edges
+- **SQLite** (access) — Mutable counters: access tracking, decay scoring, consolidation queue, validation counts
 
 ### Core Components
 
@@ -45,7 +45,7 @@ Sediment is a semantic memory system for AI agents, running as an MCP (Model Con
 - **`src/embedder.rs`** - Local embeddings using `all-MiniLM-L6-v2` via Candle (384-dim vectors)
 - **`src/chunker.rs`** - Smart content chunking by type (markdown, code, JSON, YAML, text)
 - **`src/access.rs`** - SQLite-based access tracking, validation counting, and memory decay scoring
-- **`src/graph.rs`** - Kuzu graph store: relationship tracking (RELATED, SUPERSEDES, CO_ACCESSED, CLUSTER_SIBLING edges)
+- **`src/graph.rs`** - SQLite graph store: relationship tracking (RELATED, SUPERSEDES, CO_ACCESSED, CLUSTER_SIBLING edges)
 - **`src/consolidation.rs`** - Background consolidation: auto-merging near-duplicates, linking similar items
 
 ### MCP Server (`src/mcp/`)
@@ -57,7 +57,7 @@ Sediment is a semantic memory system for AI agents, running as an MCP (Model Con
 
 ### Data Flow
 
-1. **Store**: Content → Embedder (384-dim vector) → LanceDB storage → Kuzu node creation → Provenance metadata injection → Conflict detection → Consolidation queue → Auto-tag inference
+1. **Store**: Content → Embedder (384-dim vector) → LanceDB storage → Graph node creation → Provenance metadata injection → Conflict detection → Consolidation queue → Auto-tag inference
 2. **Chunking**: Long content (>1000 chars) → Type-aware splitting → Individual chunk embeddings
 3. **Recall**: Query → Embedder → Vector similarity search → Project boosting → Decay scoring → Trust-weighted re-ranking → Graph backfill → 1-hop graph expansion → Co-access suggestions → Cross-project flagging → Background consolidation + co-access recording
 4. **Consolidation** (background): Queue candidates → >=0.95 similarity: merge (delete old, transfer edges, SUPERSEDES edge) → 0.85-0.95: link (RELATED edge)
@@ -65,8 +65,8 @@ Sediment is a semantic memory system for AI agents, running as an MCP (Model Con
 
 ### Key Design Decisions
 
-- **Three-database hybrid**: LanceDB for vectors, Kuzu for relationships, SQLite for mutable counters
-- **Single central database** at `~/.sediment/data/` stores all projects; graph at `~/.sediment/graph/`
+- **Three-database hybrid**: LanceDB for vectors, SQLite for graph relationships, SQLite for mutable counters
+- **Single central database** at `~/.sediment/data/` stores all projects; graph + access at `~/.sediment/access.db`
 - **Project scoping** via UUID stored in `.sediment/config` per project
 - **Similarity boosting**: Same-project items get 1.15x boost, different projects 0.95x penalty
 - **Conflict detection**: Items with >=0.85 similarity flagged on store and enqueued for consolidation
@@ -75,7 +75,7 @@ Sediment is a semantic memory system for AI agents, running as an MCP (Model Con
 - **Trust-weighted scoring**: `final_score = similarity * freshness * frequency * trust_bonus` where `trust_bonus = 1.0 + 0.05*ln(1+validation_count) + 0.02*edge_count`
 - **Non-blocking intelligence**: All background tasks (consolidation, co-access tracking, clustering) run as fire-and-forget `tokio::spawn` tasks. Tool responses return immediately. `Semaphore(1)` prevents concurrent consolidation.
 - **Auto-provenance**: Every store injects `metadata._provenance` with version, project_path, and supersedes chain
-- **Lazy graph backfill**: Pre-existing items get Kuzu nodes when they appear in recall results
+- **Lazy graph backfill**: Pre-existing items get graph nodes when they appear in recall results
 - **Auto-tagging**: Items stored without tags inherit `auto:` prefixed tags from 2+ similar items sharing the same tag
 
 ## MCP Tools Reference
@@ -87,7 +87,7 @@ The 5-tool API is defined in `src/mcp/tools.rs`:
 | `store` | Store content with optional title, tags, metadata, expiration, scope, replace, related |
 | `recall` | Semantic search with decay scoring, trust weighting, graph expansion, co-access suggestions, cross-project flagging |
 | `list` | List items by scope (project/global/all) with tag filtering |
-| `forget` | Delete item by ID (removes from LanceDB and Kuzu graph) |
+| `forget` | Delete item by ID (removes from LanceDB and graph) |
 | `connections` | Show full relationship graph for an item (RELATED, SUPERSEDES, CO_ACCESSED edges with content previews) |
 
 ### Store Parameters
@@ -101,20 +101,27 @@ The 5-tool API is defined in `src/mcp/tools.rs`:
 ### Connections Response
 - `item_id`, `connections[]` — each with `id`, `type` (related/supersedes/co_accessed), `strength`, optional `count`, `content_preview`
 
-## Graph Schema (Kuzu)
-
-```
-NODE TABLE Memory (id STRING PRIMARY KEY, project_id STRING, created_at INT64)
-
-REL TABLE RELATED (FROM Memory TO Memory, strength DOUBLE, rel_type STRING, created_at INT64)
-REL TABLE SUPERSEDES (FROM Memory TO Memory, created_at INT64)
-REL TABLE CO_ACCESSED (FROM Memory TO Memory, count INT64, last_at INT64)
-REL TABLE CLUSTER_SIBLING (FROM Memory TO Memory, cluster_label STRING, created_at INT64)
-```
-
 ## SQLite Schema (access.db)
 
 ```sql
+-- Graph nodes
+CREATE TABLE graph_nodes (
+    id TEXT PRIMARY KEY,
+    project_id TEXT,
+    created_at INTEGER
+);
+
+-- Graph edges (RELATED, SUPERSEDES, CO_ACCESSED, CLUSTER_SIBLING)
+CREATE TABLE graph_edges (
+    source_id TEXT, target_id TEXT,
+    rel_type TEXT,        -- 'related', 'supersedes', 'co_accessed', 'cluster_sibling'
+    strength REAL,
+    count INTEGER,
+    label TEXT,
+    created_at INTEGER,
+    UNIQUE(source_id, target_id, rel_type)
+);
+
 -- Access tracking and decay scoring
 CREATE TABLE access_log (
     item_id TEXT PRIMARY KEY,
@@ -138,4 +145,3 @@ CREATE TABLE consolidation_queue (
 - Embedder tests are marked `#[ignore]` because they require downloading the model (~90MB)
 - Use `tempfile` crate for database tests to avoid polluting real data
 - LanceDB operations are async; tests use `tokio::runtime::Runtime`
-- Kuzu requires `cxx-build = "=1.0.138"` pinned in build-dependencies to match kuzu's pinned `cxx = "=1.0.138"` (version mismatch causes linker errors)

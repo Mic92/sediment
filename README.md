@@ -2,6 +2,8 @@
 
 Semantic memory for AI agents. Local-first, MCP-native.
 
+Combines vector search, a relationship graph, and access tracking into a unified memory intelligence layer — all running locally as a single binary.
+
 ## Install
 
 ```bash
@@ -44,16 +46,18 @@ Use the Sediment MCP tools for persistent memory storage.
 - `recall` - Search by semantic similarity
 - `list` - List stored items
 - `forget` - Delete an item by ID
+- `connections` - Show relationship graph for an item
 ```
 
 ## Tools
 
 | Tool | Description |
 |------|-------------|
-| `store` | Save content with optional title, tags, and metadata |
-| `recall` | Search memories by semantic similarity |
-| `list` | List stored items with optional tag filtering |
-| `forget` | Delete an item by ID |
+| `store` | Save content with optional title, tags, metadata, expiration, scope, replace, and related item links |
+| `recall` | Search memories by semantic similarity with decay scoring, trust weighting, graph expansion, and co-access suggestions |
+| `list` | List stored items by scope (project/global/all) with tag filtering |
+| `forget` | Delete an item by ID (removes from vector store and graph) |
+| `connections` | Show relationship graph for an item (related, supersedes, co-accessed edges) |
 
 ## CLI
 
@@ -66,9 +70,30 @@ sediment list      # List stored items
 
 ## How It Works
 
-- **Storage**: LanceDB (embedded, no server)
-- **Embeddings**: all-MiniLM-L6-v2 (local, no API keys)
-- **Memory decay**: Recent and frequently-accessed memories rank higher in recall. Old memories are never deleted, just ranked lower.
-- **Data**: `~/.sediment/data/`
+### Three-Database Hybrid
+
+All local, embedded, zero config:
+
+- **LanceDB** — Vector embeddings and semantic similarity search
+- **SQLite** (graph) — Relationship tracking: RELATED, SUPERSEDES, CO_ACCESSED, CLUSTER_SIBLING edges
+- **SQLite** (access) — Mutable counters: access tracking, decay scoring, consolidation queue
+
+### Key Features
+
+- **Memory decay**: Results re-ranked by freshness (30-day half-life) and access frequency. Old memories rank lower but are never auto-deleted.
+- **Trust-weighted scoring**: Validated and well-connected memories score higher.
+- **Project scoping**: Automatic context isolation between projects. Same-project items get a similarity boost.
+- **Relationship graph**: Items linked via RELATED, SUPERSEDES, and CO_ACCESSED edges. Recall expands results with 1-hop graph neighbors and co-access suggestions.
+- **Background consolidation**: Near-duplicates (≥0.95 similarity) auto-merged; similar items (0.85–0.95) linked.
+- **Auto-tagging**: Items without tags inherit tags from similar existing items.
+- **Type-aware chunking**: Intelligent splitting for markdown, code, JSON, YAML, and plain text.
+- **Conflict detection**: Items with ≥0.85 similarity flagged on store.
+- **Cross-project recall**: Results from other projects flagged with provenance metadata.
+- **Local embeddings**: all-MiniLM-L6-v2 via Candle (384-dim vectors, no API keys).
+
+### Data Location
+
+- Vector store: `~/.sediment/data/`
+- Graph + access tracking: `~/.sediment/access.db`
 
 Everything runs locally. Your data never leaves your machine.
