@@ -166,8 +166,8 @@ pub fn get_or_create_project_id(project_root: &Path) -> std::io::Result<String> 
     std::fs::create_dir_all(&sediment_dir)?;
 
     // Save config
-    let content = serde_json::to_string_pretty(&config)
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    let content =
+        serde_json::to_string_pretty(&config).map_err(|e| std::io::Error::other(e.to_string()))?;
     std::fs::write(&config_path, content)?;
 
     Ok(config.project_id)

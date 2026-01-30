@@ -420,9 +420,10 @@ impl Database {
 
                     // Apply tag filter
                     if let Some(ref filter_tags) = filters.tags
-                        && !filter_tags.iter().any(|t| item.tags.contains(t)) {
-                            continue;
-                        }
+                        && !filter_tags.iter().any(|t| item.tags.contains(t))
+                    {
+                        continue;
+                    }
 
                     // Apply project boosting
                     let boosted_similarity = boost_similarity(
@@ -492,9 +493,10 @@ impl Database {
                 if let Some(item) = self.get_item(&item_id).await? {
                     // Apply tag filter
                     if let Some(ref filter_tags) = filters.tags
-                        && !filter_tags.iter().any(|t| item.tags.contains(t)) {
-                            continue;
-                        }
+                        && !filter_tags.iter().any(|t| item.tags.contains(t))
+                    {
+                        continue;
+                    }
 
                     // Apply project boosting
                     let boosted_similarity = boost_similarity(
@@ -808,9 +810,10 @@ fn detect_content_type(content: &str) -> ContentType {
     // Check for JSON
     if ((trimmed.starts_with('{') && trimmed.ends_with('}'))
         || (trimmed.starts_with('[') && trimmed.ends_with(']')))
-        && serde_json::from_str::<serde_json::Value>(trimmed).is_ok() {
-            return ContentType::Json;
-        }
+        && serde_json::from_str::<serde_json::Value>(trimmed).is_ok()
+    {
+        return ContentType::Json;
+    }
 
     // Check for YAML (common patterns)
     if trimmed.contains(":\n") || trimmed.starts_with("---") {

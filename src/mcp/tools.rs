@@ -282,9 +282,10 @@ pub async fn execute_tool(ctx: &ServerContext, name: &str, args: Option<Value>) 
 
             if result.is_error.unwrap_or(false)
                 && let Some(content) = result.content.first()
-                    && is_retryable_error(&content.text) {
-                        return Err(content.text.clone());
-                    }
+                && is_retryable_error(&content.text)
+            {
+                return Err(content.text.clone());
+            }
 
             Ok(result)
         }
@@ -409,36 +410,38 @@ async fn execute_store(
 
     // Set project_id based on scope
     if scope == StoreScope::Project
-        && let Some(project_id) = db.project_id() {
-            item = item.with_project_id(project_id);
-        }
+        && let Some(project_id) = db.project_id()
+    {
+        item = item.with_project_id(project_id);
+    }
 
     // Auto-tag inference (Phase 4a): if no user tags, infer from similar items
     if tags.is_empty()
-        && let Ok(similar) = db.find_similar_items(&params.content, 0.85, 5).await {
-            let mut tag_counts: std::collections::HashMap<String, usize> =
-                std::collections::HashMap::new();
-            for conflict in &similar {
-                if let Some(similar_item) = db.get_item(&conflict.id).await.ok().flatten() {
-                    for tag in &similar_item.tags {
-                        if !tag.starts_with("auto:") {
-                            *tag_counts.entry(tag.clone()).or_insert(0) += 1;
-                        }
+        && let Ok(similar) = db.find_similar_items(&params.content, 0.85, 5).await
+    {
+        let mut tag_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for conflict in &similar {
+            if let Some(similar_item) = db.get_item(&conflict.id).await.ok().flatten() {
+                for tag in &similar_item.tags {
+                    if !tag.starts_with("auto:") {
+                        *tag_counts.entry(tag.clone()).or_insert(0) += 1;
                     }
                 }
             }
-            // If 2+ similar items share a tag, auto-apply it
-            let auto_tags: Vec<String> = tag_counts
-                .into_iter()
-                .filter(|(_, count)| *count >= 2)
-                .map(|(tag, _)| format!("auto:{}", tag))
-                .collect();
-            if !auto_tags.is_empty() {
-                tags = item.tags.clone();
-                tags.extend(auto_tags);
-                item = item.with_tags(tags);
-            }
         }
+        // If 2+ similar items share a tag, auto-apply it
+        let auto_tags: Vec<String> = tag_counts
+            .into_iter()
+            .filter(|(_, count)| *count >= 2)
+            .map(|(tag, _)| format!("auto:{}", tag))
+            .collect();
+        if !auto_tags.is_empty() {
+            tags = item.tags.clone();
+            tags.extend(auto_tags);
+            item = item.with_tags(tags);
+        }
+    }
 
     match db.store_item(item).await {
         Ok(store_result) => {
@@ -465,11 +468,12 @@ async fn execute_store(
 
             // Enqueue consolidation candidates from conflicts
             if !store_result.potential_conflicts.is_empty()
-                && let Ok(queue) = ConsolidationQueue::open(&ctx.access_db_path) {
-                    for conflict in &store_result.potential_conflicts {
-                        let _ = queue.enqueue(&new_id, &conflict.id, conflict.similarity as f64);
-                    }
+                && let Ok(queue) = ConsolidationQueue::open(&ctx.access_db_path)
+            {
+                for conflict in &store_result.potential_conflicts {
+                    let _ = queue.enqueue(&new_id, &conflict.id, conflict.similarity as f64);
                 }
+            }
 
             let mut result = json!({
                 "success": true,
@@ -706,14 +710,16 @@ async fn execute_recall(
             // Cross-project flag (Phase 3c) — uses cached project_id/metadata from SearchResult
             if let Some(ref current_pid) = ctx.project_id
                 && let Some(ref item_pid) = r.project_id
-                    && item_pid != current_pid {
-                        obj["cross_project"] = json!(true);
-                        if let Some(ref meta) = r.metadata
-                            && let Some(prov) = meta.get("_provenance")
-                                && let Some(pp) = prov.get("project_path") {
-                                    obj["project_path"] = pp.clone();
-                                }
-                    }
+                && item_pid != current_pid
+            {
+                obj["cross_project"] = json!(true);
+                if let Some(ref meta) = r.metadata
+                    && let Some(prov) = meta.get("_provenance")
+                    && let Some(pp) = prov.get("project_path")
+                {
+                    obj["project_path"] = pp.clone();
+                }
+            }
 
             // Related IDs from graph (Phase 1d)
             if let Ok(neighbors) = graph.get_neighbors(&[r.id.as_str()], 0.5) {
@@ -766,17 +772,18 @@ async fn execute_recall(
         let access_db_path = ctx.access_db_path.clone();
         tokio::spawn(async move {
             if let Ok(g) = GraphStore::open(&access_db_path)
-                && let Ok(clusters) = g.detect_clusters() {
-                    for (a, b, c) in &clusters {
-                        let label = format!("cluster-{}", &a[..8.min(a.len())]);
-                        let _ = g.add_related_edge(a, b, 0.8, &label);
-                        let _ = g.add_related_edge(b, c, 0.8, &label);
-                        let _ = g.add_related_edge(a, c, 0.8, &label);
-                    }
-                    if !clusters.is_empty() {
-                        tracing::info!("Detected {} clusters", clusters.len());
-                    }
+                && let Ok(clusters) = g.detect_clusters()
+            {
+                for (a, b, c) in &clusters {
+                    let label = format!("cluster-{}", &a[..8.min(a.len())]);
+                    let _ = g.add_related_edge(a, b, 0.8, &label);
+                    let _ = g.add_related_edge(b, c, 0.8, &label);
+                    let _ = g.add_related_edge(a, c, 0.8, &label);
                 }
+                if !clusters.is_empty() {
+                    tracing::info!("Detected {} clusters", clusters.len());
+                }
+            }
         });
     }
 
