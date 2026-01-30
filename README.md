@@ -1,23 +1,51 @@
+[![Crates.io](https://img.shields.io/crates/v/sediment.svg)](https://crates.io/crates/sediment)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![CI](https://github.com/rendro/sediment/actions/workflows/ci.yml/badge.svg)](https://github.com/rendro/sediment/actions/workflows/ci.yml)
+
 # Sediment
 
 Semantic memory for AI agents. Local-first, MCP-native.
 
 Combines vector search, a relationship graph, and access tracking into a unified memory intelligence layer — all running locally as a single binary.
 
+## Why Sediment?
+
+- **Single binary, zero config** — no Docker, no Postgres, no Qdrant. Just `sediment`.
+- **Sub-25ms recall** — local embeddings and vector search, no network round-trips.
+- **5-tool focused API** — `store`, `recall`, `list`, `forget`, `connections`. That's it.
+- **Works everywhere** — macOS (Intel + ARM), Linux x86_64. All data stays on your machine.
+
+### Comparison
+
+| | Sediment | OpenMemory MCP | mcp-memory-service |
+|---|---|---|---|
+| Install | Single binary | Docker + Postgres + Qdrant | Python + pip |
+| Dependencies | None | 3 services | Python runtime + deps |
+| Tools | 5 | 10+ | 24 |
+| Embeddings | Local (all-MiniLM-L6-v2) | API-dependent | API-dependent |
+| Graph features | Built-in | No | No |
+| Memory decay | Built-in | No | No |
+
 ## Install
 
 ```bash
+# Via crates.io
+cargo install sediment
+
 # Via Homebrew
 brew tap rendro/tap
 brew install sediment
 
-# Or from source
+# Via shell installer
+curl -fsSL https://raw.githubusercontent.com/rendro/sediment/main/install.sh | sh
+
+# From source
 cargo install --path .
 ```
 
 ## Setup
 
-Add Sediment to your MCP configuration:
+Add Sediment to your MCP client configuration:
 
 ### Claude Desktop
 
@@ -35,18 +63,70 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
 ### Claude Code
 
-Run `sediment init` in your project, or add to `~/.claude/CLAUDE.md`:
+Run `sediment init` in your project, or add manually to `~/.claude/settings.json`:
 
-```markdown
-## Sediment Memory System
+```json
+{
+  "mcpServers": {
+    "sediment": {
+      "command": "sediment"
+    }
+  }
+}
+```
 
-Use the Sediment MCP tools for persistent memory storage.
+### Cursor
 
-- `store` - Store content for later retrieval
-- `recall` - Search by semantic similarity
-- `list` - List stored items
-- `forget` - Delete an item by ID
-- `connections` - Show relationship graph for an item
+Add to `.cursor/mcp.json` in your project:
+
+```json
+{
+  "mcpServers": {
+    "sediment": {
+      "command": "sediment"
+    }
+  }
+}
+```
+
+### VS Code (Copilot)
+
+Add to `.vscode/mcp.json` in your project:
+
+```json
+{
+  "servers": {
+    "sediment": {
+      "command": "sediment"
+    }
+  }
+}
+```
+
+### Windsurf
+
+Add to `~/.codeium/windsurf/mcp_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "sediment": {
+      "command": "sediment"
+    }
+  }
+}
+```
+
+### JetBrains IDEs
+
+Go to **Settings > Tools > AI Assistant > MCP Servers**, click **+**, and add:
+
+```json
+{
+  "sediment": {
+    "command": "sediment"
+  }
+}
 ```
 
 ## Tools
@@ -91,9 +171,27 @@ All local, embedded, zero config:
 - **Cross-project recall**: Results from other projects flagged with provenance metadata.
 - **Local embeddings**: all-MiniLM-L6-v2 via Candle (384-dim vectors, no API keys).
 
+## Performance
+
+Sub-25ms recall latency at 10K items with full graph features enabled. See [BENCHMARKS.md](BENCHMARKS.md) for detailed numbers.
+
+| DB Size | Graph Off | Graph On |
+|---------|-----------|----------|
+| 100     | ~8ms      | ~10ms    |
+| 1,000   | ~12ms     | ~15ms   |
+| 10,000  | ~18ms     | ~23ms   |
+
 ### Data Location
 
 - Vector store: `~/.sediment/data/`
 - Graph + access tracking: `~/.sediment/access.db`
 
 Everything runs locally. Your data never leaves your machine.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for build instructions and PR guidelines.
+
+## License
+
+[MIT](LICENSE)
