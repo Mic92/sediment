@@ -1,5 +1,5 @@
 [package]
-name = "sediment"
+name = "sediment-mcp"
 version = "0.2.1"
 edition = "2024"
 repository = "https://github.com/rendro/sediment"
@@ -10,6 +10,10 @@ license = "MIT"
 readme = "README.md"
 keywords = ["mcp", "memory", "semantic-search", "ai-agent", "embeddings"]
 categories = ["command-line-utilities", "database"]
+
+[lib]
+name = "sediment"
+path = "src/lib.rs"
 
 [[bin]]
 name = "sediment"
