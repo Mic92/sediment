@@ -3,8 +3,13 @@ name = "sediment"
 version = "0.2.0"
 edition = "2024"
 repository = "https://github.com/rendro/sediment"
+homepage = "https://github.com/rendro/sediment"
 authors = ["rendro"]
 description = "Semantic memory for AI agents - local-first, MCP-native"
+license = "MIT"
+readme = "README.md"
+keywords = ["mcp", "memory", "semantic-search", "ai-agent", "embeddings"]
+categories = ["command-line-utilities", "database"]
 
 [[bin]]
 name = "sediment"
