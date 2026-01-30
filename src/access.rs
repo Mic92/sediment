@@ -44,7 +44,7 @@ impl AccessTracker {
 
         // Idempotent schema migration: add validation_count column
         let _ = conn.execute_batch(
-            "ALTER TABLE access_log ADD COLUMN validation_count INTEGER NOT NULL DEFAULT 0;"
+            "ALTER TABLE access_log ADD COLUMN validation_count INTEGER NOT NULL DEFAULT 0;",
         );
 
         Ok(Self { conn })
@@ -62,9 +62,7 @@ impl AccessTracker {
                      last_accessed_at = ?2",
                 params![item_id, now, created_at],
             )
-            .map_err(|e| {
-                SedimentError::Database(format!("Failed to record access: {}", e))
-            })?;
+            .map_err(|e| SedimentError::Database(format!("Failed to record access: {}", e)))?;
         Ok(())
     }
 
@@ -88,7 +86,8 @@ impl AccessTracker {
 
     /// Get validation count for an item.
     pub fn get_validation_count(&self, item_id: &str) -> Result<u32> {
-        let count: u32 = self.conn
+        let count: u32 = self
+            .conn
             .query_row(
                 "SELECT COALESCE(validation_count, 0) FROM access_log WHERE item_id = ?1",
                 params![item_id],
@@ -104,15 +103,20 @@ impl AccessTracker {
             return Ok(HashMap::new());
         }
 
-        let placeholders: Vec<String> = item_ids.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect();
+        let placeholders: Vec<String> = item_ids
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 1))
+            .collect();
         let sql = format!(
             "SELECT item_id, access_count, last_accessed_at, created_at FROM access_log WHERE item_id IN ({})",
             placeholders.join(", ")
         );
 
-        let mut stmt = self.conn.prepare(&sql).map_err(|e| {
-            SedimentError::Database(format!("Failed to prepare query: {}", e))
-        })?;
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(|e| SedimentError::Database(format!("Failed to prepare query: {}", e)))?;
 
         let params: Vec<&dyn rusqlite::types::ToSql> = item_ids
             .iter()
@@ -130,9 +134,7 @@ impl AccessTracker {
                     },
                 ))
             })
-            .map_err(|e| {
-                SedimentError::Database(format!("Failed to query accesses: {}", e))
-            })?;
+            .map_err(|e| SedimentError::Database(format!("Failed to query accesses: {}", e)))?;
 
         let mut map = HashMap::new();
         for row in rows {
