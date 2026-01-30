@@ -40,8 +40,9 @@ impl ConsolidationQueue {
                 status TEXT NOT NULL DEFAULT 'pending',
                 created_at INTEGER NOT NULL,
                 UNIQUE(item_id_a, item_id_b)
-            );"
-        ).map_err(|e| {
+            );",
+        )
+        .map_err(|e| {
             SedimentError::Database(format!("Failed to create consolidation_queue table: {}", e))
         })?;
 
@@ -67,36 +68,39 @@ impl ConsolidationQueue {
             SedimentError::Database(format!("Failed to enqueue consolidation: {}", e))
         })?;
 
-        debug!("Enqueued consolidation: {} <-> {} (similarity: {:.2})", a, b, similarity);
+        debug!(
+            "Enqueued consolidation: {} <-> {} (similarity: {:.2})",
+            a, b, similarity
+        );
         Ok(())
     }
 
     /// Fetch up to `limit` pending candidates.
     pub fn fetch_pending(&self, limit: usize) -> Result<Vec<ConsolidationCandidate>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT item_id_a, item_id_b, similarity FROM consolidation_queue
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT item_id_a, item_id_b, similarity FROM consolidation_queue
              WHERE status = 'pending'
              ORDER BY similarity DESC
-             LIMIT ?1"
-        ).map_err(|e| {
-            SedimentError::Database(format!("Failed to prepare fetch: {}", e))
-        })?;
+             LIMIT ?1",
+            )
+            .map_err(|e| SedimentError::Database(format!("Failed to prepare fetch: {}", e)))?;
 
-        let rows = stmt.query_map(params![limit as i64], |row| {
-            Ok(ConsolidationCandidate {
-                item_id_a: row.get(0)?,
-                item_id_b: row.get(1)?,
-                similarity: row.get(2)?,
+        let rows = stmt
+            .query_map(params![limit as i64], |row| {
+                Ok(ConsolidationCandidate {
+                    item_id_a: row.get(0)?,
+                    item_id_b: row.get(1)?,
+                    similarity: row.get(2)?,
+                })
             })
-        }).map_err(|e| {
-            SedimentError::Database(format!("Failed to fetch pending: {}", e))
-        })?;
+            .map_err(|e| SedimentError::Database(format!("Failed to fetch pending: {}", e)))?;
 
         let mut candidates = Vec::new();
         for row in rows {
-            let candidate = row.map_err(|e| {
-                SedimentError::Database(format!("Failed to read candidate: {}", e))
-            })?;
+            let candidate = row
+                .map_err(|e| SedimentError::Database(format!("Failed to read candidate: {}", e)))?;
             candidates.push(candidate);
         }
 
@@ -141,12 +145,9 @@ pub fn spawn_consolidation(
             }
         };
 
-        if let Err(e) = run_consolidation_batch(
-            &db_path,
-            &access_db_path,
-            project_id,
-            embedder,
-        ).await {
+        if let Err(e) =
+            run_consolidation_batch(&db_path, &access_db_path, project_id, embedder).await
+        {
             warn!("Consolidation error: {}", e);
         }
 

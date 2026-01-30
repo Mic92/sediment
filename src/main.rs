@@ -112,10 +112,10 @@ fn run_mcp_server(db_override: Option<PathBuf>) -> Result<()> {
 
 /// Check if a file contains Sediment instructions
 fn has_sediment_instructions(path: &PathBuf) -> bool {
-    if path.exists() {
-        if let Ok(content) = std::fs::read_to_string(path) {
-            return content.contains("mcp__sediment__");
-        }
+    if path.exists()
+        && let Ok(content) = std::fs::read_to_string(path)
+    {
+        return content.contains("mcp__sediment__");
     }
     false
 }

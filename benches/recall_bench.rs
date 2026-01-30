@@ -7,8 +7,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use rand::rngs::StdRng;
 use rand::SeedableRng;
+use rand::rngs::StdRng;
 use tempfile::TempDir;
 
 use sediment::access::AccessTracker;
@@ -53,13 +53,21 @@ const QUERIES: &[&str] = &[
 
 fn generate_content(index: usize) -> String {
     match index % 3 {
-        0 => format!("{} (variant {})", SHORT_TEXTS[index % SHORT_TEXTS.len()], index),
+        0 => format!(
+            "{} (variant {})",
+            SHORT_TEXTS[index % SHORT_TEXTS.len()],
+            index
+        ),
         1 => format!(
             "{}\n\n<!-- variant {} -->",
             MARKDOWN_TEXTS[index % MARKDOWN_TEXTS.len()],
             index
         ),
-        _ => format!("// variant {}\n{}", index, CODE_TEXTS[index % CODE_TEXTS.len()]),
+        _ => format!(
+            "// variant {}\n{}",
+            index,
+            CODE_TEXTS[index % CODE_TEXTS.len()]
+        ),
     }
 }
 

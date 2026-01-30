@@ -280,12 +280,11 @@ pub async fn execute_tool(ctx: &ServerContext, name: &str, args: Option<Value>) 
                 _ => return Ok(CallToolResult::error(format!("Unknown tool: {}", name_ref))),
             };
 
-            if result.is_error.unwrap_or(false) {
-                if let Some(content) = result.content.first() {
-                    if is_retryable_error(&content.text) {
-                        return Err(content.text.clone());
-                    }
-                }
+            if result.is_error.unwrap_or(false)
+                && let Some(content) = result.content.first()
+                && is_retryable_error(&content.text)
+            {
+                return Err(content.text.clone());
             }
 
             Ok(result)
@@ -410,36 +409,37 @@ async fn execute_store(
     }
 
     // Set project_id based on scope
-    if scope == StoreScope::Project {
-        if let Some(project_id) = db.project_id() {
-            item = item.with_project_id(project_id);
-        }
+    if scope == StoreScope::Project
+        && let Some(project_id) = db.project_id()
+    {
+        item = item.with_project_id(project_id);
     }
 
     // Auto-tag inference (Phase 4a): if no user tags, infer from similar items
-    if tags.is_empty() {
-        if let Ok(similar) = db.find_similar_items(&params.content, 0.85, 5).await {
-            let mut tag_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-            for conflict in &similar {
-                if let Some(similar_item) = db.get_item(&conflict.id).await.ok().flatten() {
-                    for tag in &similar_item.tags {
-                        if !tag.starts_with("auto:") {
-                            *tag_counts.entry(tag.clone()).or_insert(0) += 1;
-                        }
+    if tags.is_empty()
+        && let Ok(similar) = db.find_similar_items(&params.content, 0.85, 5).await
+    {
+        let mut tag_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for conflict in &similar {
+            if let Some(similar_item) = db.get_item(&conflict.id).await.ok().flatten() {
+                for tag in &similar_item.tags {
+                    if !tag.starts_with("auto:") {
+                        *tag_counts.entry(tag.clone()).or_insert(0) += 1;
                     }
                 }
             }
-            // If 2+ similar items share a tag, auto-apply it
-            let auto_tags: Vec<String> = tag_counts
-                .into_iter()
-                .filter(|(_, count)| *count >= 2)
-                .map(|(tag, _)| format!("auto:{}", tag))
-                .collect();
-            if !auto_tags.is_empty() {
-                tags = item.tags.clone();
-                tags.extend(auto_tags);
-                item = item.with_tags(tags);
-            }
+        }
+        // If 2+ similar items share a tag, auto-apply it
+        let auto_tags: Vec<String> = tag_counts
+            .into_iter()
+            .filter(|(_, count)| *count >= 2)
+            .map(|(tag, _)| format!("auto:{}", tag))
+            .collect();
+        if !auto_tags.is_empty() {
+            tags = item.tags.clone();
+            tags.extend(auto_tags);
+            item = item.with_tags(tags);
         }
     }
 
@@ -467,11 +467,11 @@ async fn execute_store(
             }
 
             // Enqueue consolidation candidates from conflicts
-            if !store_result.potential_conflicts.is_empty() {
-                if let Ok(queue) = ConsolidationQueue::open(&ctx.access_db_path) {
-                    for conflict in &store_result.potential_conflicts {
-                        let _ = queue.enqueue(&new_id, &conflict.id, conflict.similarity as f64);
-                    }
+            if !store_result.potential_conflicts.is_empty()
+                && let Ok(queue) = ConsolidationQueue::open(&ctx.access_db_path)
+            {
+                for conflict in &store_result.potential_conflicts {
+                    let _ = queue.enqueue(&new_id, &conflict.id, conflict.similarity as f64);
                 }
             }
 
@@ -552,14 +552,18 @@ pub async fn recall_pipeline(
                 None => (0, None),
             };
 
-            let base_score =
-                score_with_decay(result.similarity, now, created_at, access_count, last_accessed);
+            let base_score = score_with_decay(
+                result.similarity,
+                now,
+                created_at,
+                access_count,
+                last_accessed,
+            );
 
             let validation_count = tracker.get_validation_count(&result.id).unwrap_or(0);
             let edge_count = graph.get_edge_count(&result.id).unwrap_or(0);
-            let trust_bonus = 1.0
-                + 0.05 * (1.0 + validation_count as f64).ln() as f32
-                + 0.02 * edge_count as f32;
+            let trust_bonus =
+                1.0 + 0.05 * (1.0 + validation_count as f64).ln() as f32 + 0.02 * edge_count as f32;
 
             result.similarity = base_score * trust_bonus;
         }
@@ -671,10 +675,11 @@ async fn execute_recall(
 
     let config = RecallConfig::default();
 
-    let recall_result = match recall_pipeline(db, tracker, graph, &params.query, limit, filters, &config).await {
-        Ok(r) => r,
-        Err(e) => return CallToolResult::error(e),
-    };
+    let recall_result =
+        match recall_pipeline(db, tracker, graph, &params.query, limit, filters, &config).await {
+            Ok(r) => r,
+            Err(e) => return CallToolResult::error(e),
+        };
 
     if recall_result.results.is_empty() {
         return CallToolResult::success("No items found matching your query.");
@@ -703,27 +708,22 @@ async fn execute_recall(
             }
 
             // Cross-project flag (Phase 3c) — uses cached project_id/metadata from SearchResult
-            if let Some(ref current_pid) = ctx.project_id {
-                if let Some(ref item_pid) = r.project_id {
-                    if item_pid != current_pid {
-                        obj["cross_project"] = json!(true);
-                        if let Some(ref meta) = r.metadata {
-                            if let Some(prov) = meta.get("_provenance") {
-                                if let Some(pp) = prov.get("project_path") {
-                                    obj["project_path"] = pp.clone();
-                                }
-                            }
-                        }
-                    }
+            if let Some(ref current_pid) = ctx.project_id
+                && let Some(ref item_pid) = r.project_id
+                && item_pid != current_pid
+            {
+                obj["cross_project"] = json!(true);
+                if let Some(ref meta) = r.metadata
+                    && let Some(prov) = meta.get("_provenance")
+                    && let Some(pp) = prov.get("project_path")
+                {
+                    obj["project_path"] = pp.clone();
                 }
             }
 
             // Related IDs from graph (Phase 1d)
             if let Ok(neighbors) = graph.get_neighbors(&[r.id.as_str()], 0.5) {
-                let related: Vec<String> = neighbors
-                    .iter()
-                    .map(|(id, _, _)| id.clone())
-                    .collect();
+                let related: Vec<String> = neighbors.iter().map(|(id, _, _)| id.clone()).collect();
                 if !related.is_empty() {
                     obj["related_ids"] = json!(related);
                 }
@@ -765,21 +765,23 @@ async fn execute_recall(
     });
 
     // Periodic clustering (Phase 4b): every 10th consolidation run
-    let run_count = ctx.consolidation_run_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let run_count = ctx
+        .consolidation_run_count
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if run_count % 10 == 9 {
         let access_db_path = ctx.access_db_path.clone();
         tokio::spawn(async move {
-            if let Ok(g) = GraphStore::open(&access_db_path) {
-                if let Ok(clusters) = g.detect_clusters() {
-                    for (a, b, c) in &clusters {
-                        let label = format!("cluster-{}", &a[..8.min(a.len())]);
-                        let _ = g.add_related_edge(a, b, 0.8, &label);
-                        let _ = g.add_related_edge(b, c, 0.8, &label);
-                        let _ = g.add_related_edge(a, c, 0.8, &label);
-                    }
-                    if !clusters.is_empty() {
-                        tracing::info!("Detected {} clusters", clusters.len());
-                    }
+            if let Ok(g) = GraphStore::open(&access_db_path)
+                && let Ok(clusters) = g.detect_clusters()
+            {
+                for (a, b, c) in &clusters {
+                    let label = format!("cluster-{}", &a[..8.min(a.len())]);
+                    let _ = g.add_related_edge(a, b, 0.8, &label);
+                    let _ = g.add_related_edge(b, c, 0.8, &label);
+                    let _ = g.add_related_edge(a, c, 0.8, &label);
+                }
+                if !clusters.is_empty() {
+                    tracing::info!("Detected {} clusters", clusters.len());
                 }
             }
         });
@@ -857,7 +859,11 @@ async fn execute_list(db: &mut Database, args: Option<Value>) -> CallToolResult 
     }
 }
 
-async fn execute_forget(db: &mut Database, graph: &GraphStore, args: Option<Value>) -> CallToolResult {
+async fn execute_forget(
+    db: &mut Database,
+    graph: &GraphStore,
+    args: Option<Value>,
+) -> CallToolResult {
     let params: ForgetParams = match args {
         Some(v) => match serde_json::from_value(v) {
             Ok(p) => p,

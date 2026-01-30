@@ -207,14 +207,11 @@ impl Database {
                 }
 
                 // Check if index already exists by listing indices
-                let indices = table
-                    .list_indices()
-                    .await
-                    .unwrap_or_default();
+                let indices = table.list_indices().await.unwrap_or_default();
 
-                let has_vector_index = indices.iter().any(|idx| {
-                    idx.columns.contains(&"vector".to_string())
-                });
+                let has_vector_index = indices
+                    .iter()
+                    .any(|idx| idx.columns.contains(&"vector".to_string()));
 
                 if !has_vector_index {
                     info!(
@@ -229,11 +226,7 @@ impl Database {
                         Ok(_) => info!("Vector index created on {} table", name),
                         Err(e) => {
                             // Non-fatal: brute-force search still works
-                            tracing::warn!(
-                                "Failed to create vector index on {}: {}",
-                                name,
-                                e
-                            );
+                            tracing::warn!("Failed to create vector index on {}: {}", name, e);
                         }
                     }
                 }
@@ -426,10 +419,10 @@ impl Database {
                     }
 
                     // Apply tag filter
-                    if let Some(ref filter_tags) = filters.tags {
-                        if !filter_tags.iter().any(|t| item.tags.contains(t)) {
-                            continue;
-                        }
+                    if let Some(ref filter_tags) = filters.tags
+                        && !filter_tags.iter().any(|t| item.tags.contains(t))
+                    {
+                        continue;
                     }
 
                     // Apply project boosting
@@ -499,10 +492,10 @@ impl Database {
             for (item_id, (excerpt, chunk_similarity)) in chunk_matches {
                 if let Some(item) = self.get_item(&item_id).await? {
                     // Apply tag filter
-                    if let Some(ref filter_tags) = filters.tags {
-                        if !filter_tags.iter().any(|t| item.tags.contains(t)) {
-                            continue;
-                        }
+                    if let Some(ref filter_tags) = filters.tags
+                        && !filter_tags.iter().any(|t| item.tags.contains(t))
+                    {
+                        continue;
                     }
 
                     // Apply project boosting
@@ -815,12 +808,11 @@ fn detect_content_type(content: &str) -> ContentType {
     let trimmed = content.trim();
 
     // Check for JSON
-    if (trimmed.starts_with('{') && trimmed.ends_with('}'))
-        || (trimmed.starts_with('[') && trimmed.ends_with(']'))
+    if ((trimmed.starts_with('{') && trimmed.ends_with('}'))
+        || (trimmed.starts_with('[') && trimmed.ends_with(']')))
+        && serde_json::from_str::<serde_json::Value>(trimmed).is_ok()
     {
-        if serde_json::from_str::<serde_json::Value>(trimmed).is_ok() {
-            return ContentType::Json;
-        }
+        return ContentType::Json;
     }
 
     // Check for YAML (common patterns)

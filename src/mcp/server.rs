@@ -46,9 +46,7 @@ pub fn run(db_path: &Path, project_id: Option<String>) -> Result<()> {
     tracing::info!("Embedder loaded successfully");
 
     // Derive access DB path as sibling to the LanceDB data directory
-    let sediment_dir = db_path
-        .parent()
-        .unwrap_or(db_path);
+    let sediment_dir = db_path.parent().unwrap_or(db_path);
     let access_db_path = sediment_dir.join("access.db");
 
     // Get current working directory

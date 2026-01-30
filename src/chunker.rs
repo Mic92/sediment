@@ -1213,7 +1213,7 @@ mod tests {
         };
         let chunks = chunk_content(&content, ContentType::Json, &config);
 
-        assert!(chunks.len() >= 1);
+        assert!(!chunks.is_empty());
     }
 
     #[test]
@@ -1267,7 +1267,7 @@ database:
         let chunks = chunk_content(content, ContentType::Yaml, &config);
 
         // Should have chunks for server and database sections
-        assert!(chunks.len() >= 1);
+        assert!(!chunks.is_empty());
     }
 
     #[test]
