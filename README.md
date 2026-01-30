@@ -1,4 +1,4 @@
-[![Crates.io](https://img.shields.io/crates/v/sediment.svg)](https://crates.io/crates/sediment)
+[![Crates.io](https://img.shields.io/crates/v/sediment-mcp.svg)](https://crates.io/crates/sediment-mcp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![CI](https://github.com/rendro/sediment/actions/workflows/ci.yml/badge.svg)](https://github.com/rendro/sediment/actions/workflows/ci.yml)
 
@@ -30,7 +30,7 @@ Combines vector search, a relationship graph, and access tracking into a unified
 
 ```bash
 # Via crates.io
-cargo install sediment
+cargo install sediment-mcp
 
 # Via Homebrew
 brew tap rendro/tap
