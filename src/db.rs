@@ -6,6 +6,12 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// Sanitize a string value for use in LanceDB SQL filter expressions
+/// by escaping single quotes to prevent injection attacks.
+fn sanitize_sql_string(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
 use arrow_array::{
     Array, BooleanArray, FixedSizeListArray, Float32Array, Int32Array, Int64Array, RecordBatch,
     RecordBatchIterator, StringArray,
@@ -616,7 +622,7 @@ impl Database {
         match scope {
             crate::ListScope::Project => {
                 if let Some(ref pid) = self.project_id {
-                    filter_parts.push(format!("project_id = '{}'", pid));
+                    filter_parts.push(format!("project_id = '{}'", sanitize_sql_string(pid)));
                 }
             }
             crate::ListScope::Global => {
@@ -668,7 +674,7 @@ impl Database {
 
         let results = table
             .query()
-            .only_if(format!("id = '{}'", id))
+            .only_if(format!("id = '{}'", sanitize_sql_string(id)))
             .limit(1)
             .execute()
             .await
@@ -698,7 +704,10 @@ impl Database {
             return Ok(Vec::new());
         }
 
-        let quoted: Vec<String> = ids.iter().map(|id| format!("'{}'", id)).collect();
+        let quoted: Vec<String> = ids
+            .iter()
+            .map(|id| format!("'{}'", sanitize_sql_string(id)))
+            .collect();
         let filter = format!("id IN ({})", quoted.join(", "));
 
         let results = table
@@ -724,7 +733,7 @@ impl Database {
         // Delete chunks first
         if let Some(chunks_table) = &self.chunks_table {
             chunks_table
-                .delete(&format!("item_id = '{}'", id))
+                .delete(&format!("item_id = '{}'", sanitize_sql_string(id)))
                 .await
                 .map_err(|e| SedimentError::Database(format!("Delete chunks failed: {}", e)))?;
         }
@@ -736,7 +745,7 @@ impl Database {
         };
 
         table
-            .delete(&format!("id = '{}'", id))
+            .delete(&format!("id = '{}'", sanitize_sql_string(id)))
             .await
             .map_err(|e| SedimentError::Database(format!("Delete failed: {}", e)))?;
 
