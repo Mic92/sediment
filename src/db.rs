@@ -148,6 +148,7 @@ impl Database {
         };
 
         database.ensure_tables().await?;
+        database.ensure_vector_index().await?;
 
         Ok(database)
     }
@@ -186,6 +187,57 @@ impl Database {
                 Some(self.db.open_table("chunks").execute().await.map_err(|e| {
                     SedimentError::Database(format!("Failed to open chunks: {}", e))
                 })?);
+        }
+
+        Ok(())
+    }
+
+    /// Ensure vector indexes exist on tables with enough rows.
+    ///
+    /// LanceDB requires at least 256 rows before creating an index.
+    /// Once created, the index converts brute-force scans to HNSW/IVF-PQ.
+    async fn ensure_vector_index(&self) -> Result<()> {
+        const MIN_ROWS_FOR_INDEX: usize = 256;
+
+        for (name, table_opt) in [("items", &self.items_table), ("chunks", &self.chunks_table)] {
+            if let Some(table) = table_opt {
+                let row_count = table.count_rows(None).await.unwrap_or(0);
+                if row_count < MIN_ROWS_FOR_INDEX {
+                    continue;
+                }
+
+                // Check if index already exists by listing indices
+                let indices = table
+                    .list_indices()
+                    .await
+                    .unwrap_or_default();
+
+                let has_vector_index = indices.iter().any(|idx| {
+                    idx.columns.contains(&"vector".to_string())
+                });
+
+                if !has_vector_index {
+                    info!(
+                        "Creating vector index on {} table ({} rows)",
+                        name, row_count
+                    );
+                    match table
+                        .create_index(&["vector"], lancedb::index::Index::Auto)
+                        .execute()
+                        .await
+                    {
+                        Ok(_) => info!("Vector index created on {} table", name),
+                        Err(e) => {
+                            // Non-fatal: brute-force search still works
+                            tracing::warn!(
+                                "Failed to create vector index on {}: {}",
+                                name,
+                                e
+                            );
+                        }
+                    }
+                }
+            }
         }
 
         Ok(())
@@ -640,6 +692,38 @@ impl Database {
         }
 
         Ok(None)
+    }
+
+    /// Get multiple items by ID in a single query
+    pub async fn get_items_batch(&self, ids: &[&str]) -> Result<Vec<Item>> {
+        let table = match &self.items_table {
+            Some(t) => t,
+            None => return Ok(Vec::new()),
+        };
+
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let quoted: Vec<String> = ids.iter().map(|id| format!("'{}'", id)).collect();
+        let filter = format!("id IN ({})", quoted.join(", "));
+
+        let results = table
+            .query()
+            .only_if(filter)
+            .execute()
+            .await
+            .map_err(|e| SedimentError::Database(format!("Batch query failed: {}", e)))?
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(|e| SedimentError::Database(format!("Failed to collect batch: {}", e)))?;
+
+        let mut items = Vec::new();
+        for batch in results {
+            items.extend(batch_to_items(&batch)?);
+        }
+
+        Ok(items)
     }
 
     /// Delete an item and its chunks

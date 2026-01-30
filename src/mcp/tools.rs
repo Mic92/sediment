@@ -211,6 +211,37 @@ pub struct ConnectionsParams {
     pub id: String,
 }
 
+// ========== Recall Configuration ==========
+
+/// Controls which graph and scoring features are enabled during recall.
+/// Used by benchmarks to measure the impact of individual features.
+pub struct RecallConfig {
+    pub enable_graph_backfill: bool,
+    pub enable_graph_expansion: bool,
+    pub enable_co_access: bool,
+    pub enable_decay_scoring: bool,
+    pub enable_background_tasks: bool,
+}
+
+impl Default for RecallConfig {
+    fn default() -> Self {
+        Self {
+            enable_graph_backfill: true,
+            enable_graph_expansion: true,
+            enable_co_access: true,
+            enable_decay_scoring: true,
+            enable_background_tasks: true,
+        }
+    }
+}
+
+/// Result of a recall pipeline execution (for benchmark consumption).
+pub struct RecallResult {
+    pub results: Vec<crate::item::SearchResult>,
+    pub graph_expanded: Vec<Value>,
+    pub suggested: Vec<Value>,
+}
+
 // ========== Tool Execution ==========
 
 pub async fn execute_tool(ctx: &ServerContext, name: &str, args: Option<Value>) -> CallToolResult {
@@ -236,8 +267,8 @@ pub async fn execute_tool(ctx: &ServerContext, name: &str, args: Option<Value>) 
             let tracker = AccessTracker::open(&ctx_ref.access_db_path)
                 .map_err(|e| format!("Failed to open access tracker: {}", e))?;
 
-            // Open graph store (lazy init)
-            let graph = GraphStore::open(&ctx_ref.graph_path)
+            // Open graph store (shares access.db)
+            let graph = GraphStore::open(&ctx_ref.access_db_path)
                 .map_err(|e| format!("Failed to open graph store: {}", e))?;
 
             let result = match name_ref {
@@ -471,6 +502,149 @@ async fn execute_store(
     }
 }
 
+/// Core recall pipeline, extracted for benchmarking.
+///
+/// Performs: vector search, optional decay scoring, optional graph backfill,
+/// optional 1-hop graph expansion, and optional co-access suggestions.
+pub async fn recall_pipeline(
+    db: &mut Database,
+    tracker: &AccessTracker,
+    graph: &GraphStore,
+    query: &str,
+    limit: usize,
+    filters: ItemFilters,
+    config: &RecallConfig,
+) -> std::result::Result<RecallResult, String> {
+    let mut results = db
+        .search_items(query, limit, filters)
+        .await
+        .map_err(|e| format!("Search failed: {}", e))?;
+
+    if results.is_empty() {
+        return Ok(RecallResult {
+            results: Vec::new(),
+            graph_expanded: Vec::new(),
+            suggested: Vec::new(),
+        });
+    }
+
+    // Lazy graph backfill (uses project_id from SearchResult, no extra queries)
+    if config.enable_graph_backfill {
+        for result in &results {
+            let _ = graph.ensure_node_exists(
+                &result.id,
+                result.project_id.as_deref(),
+                result.created_at.timestamp(),
+            );
+        }
+    }
+
+    // Decay scoring
+    if config.enable_decay_scoring {
+        let item_ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
+        let access_records = tracker.get_accesses(&item_ids).unwrap_or_default();
+        let now = chrono::Utc::now().timestamp();
+
+        for result in &mut results {
+            let created_at = result.created_at.timestamp();
+            let (access_count, last_accessed) = match access_records.get(&result.id) {
+                Some(rec) => (rec.access_count, Some(rec.last_accessed_at)),
+                None => (0, None),
+            };
+
+            let base_score =
+                score_with_decay(result.similarity, now, created_at, access_count, last_accessed);
+
+            let validation_count = tracker.get_validation_count(&result.id).unwrap_or(0);
+            let edge_count = graph.get_edge_count(&result.id).unwrap_or(0);
+            let trust_bonus = 1.0
+                + 0.05 * (1.0 + validation_count as f64).ln() as f32
+                + 0.02 * edge_count as f32;
+
+            result.similarity = base_score * trust_bonus;
+        }
+
+        results.sort_by(|a, b| b.similarity.partial_cmp(&a.similarity).unwrap());
+    }
+
+    // Record access
+    for result in &results {
+        let created_at = result.created_at.timestamp();
+        let _ = tracker.record_access(&result.id, created_at);
+    }
+
+    // Graph expansion
+    let existing_ids: std::collections::HashSet<String> =
+        results.iter().map(|r| r.id.clone()).collect();
+
+    let mut graph_expanded = Vec::new();
+    if config.enable_graph_expansion {
+        let top_ids: Vec<&str> = results.iter().take(5).map(|r| r.id.as_str()).collect();
+        if let Ok(neighbors) = graph.get_neighbors(&top_ids, 0.5) {
+            // Collect neighbor IDs not already in results, then batch fetch
+            let neighbor_info: Vec<(String, String)> = neighbors
+                .into_iter()
+                .filter(|(id, _, _)| !existing_ids.contains(id))
+                .map(|(id, rel_type, _)| (id, rel_type))
+                .collect();
+
+            let neighbor_ids: Vec<&str> = neighbor_info.iter().map(|(id, _)| id.as_str()).collect();
+            if let Ok(items) = db.get_items_batch(&neighbor_ids).await {
+                let item_map: std::collections::HashMap<&str, &Item> =
+                    items.iter().map(|item| (item.id.as_str(), item)).collect();
+
+                for (neighbor_id, rel_type) in &neighbor_info {
+                    if let Some(item) = item_map.get(neighbor_id.as_str()) {
+                        let sr = crate::item::SearchResult::from_item(item, 0.05);
+                        graph_expanded.push(json!({
+                            "id": sr.id,
+                            "content": sr.content,
+                            "similarity": "graph",
+                            "created": sr.created_at.to_rfc3339(),
+                            "graph_expanded": true,
+                            "rel_type": rel_type,
+                        }));
+                    }
+                }
+            }
+        }
+    }
+
+    // Co-access suggestions (batch fetch)
+    let mut suggested = Vec::new();
+    if config.enable_co_access {
+        let top3_ids: Vec<&str> = results.iter().take(3).map(|r| r.id.as_str()).collect();
+        if let Ok(co_accessed) = graph.get_co_accessed(&top3_ids, 3) {
+            let co_info: Vec<(String, i64)> = co_accessed
+                .into_iter()
+                .filter(|(id, _)| !existing_ids.contains(id))
+                .collect();
+
+            let co_ids: Vec<&str> = co_info.iter().map(|(id, _)| id.as_str()).collect();
+            if let Ok(items) = db.get_items_batch(&co_ids).await {
+                let item_map: std::collections::HashMap<&str, &Item> =
+                    items.iter().map(|item| (item.id.as_str(), item)).collect();
+
+                for (co_id, co_count) in &co_info {
+                    if let Some(item) = item_map.get(co_id.as_str()) {
+                        suggested.push(json!({
+                            "id": item.id,
+                            "content": truncate(&item.content, 100),
+                            "reason": format!("frequently recalled with result (co-accessed {} times)", co_count),
+                        }));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(RecallResult {
+        results,
+        graph_expanded,
+        suggested,
+    })
+}
+
 async fn execute_recall(
     db: &mut Database,
     tracker: &AccessTracker,
@@ -495,220 +669,123 @@ async fn execute_recall(
         filters = filters.with_tags(tags);
     }
 
-    match db.search_items(&params.query, limit, filters).await {
-        Ok(mut results) => {
-            if results.is_empty() {
-                return CallToolResult::success("No items found matching your query.");
+    let config = RecallConfig::default();
+
+    let recall_result = match recall_pipeline(db, tracker, graph, &params.query, limit, filters, &config).await {
+        Ok(r) => r,
+        Err(e) => return CallToolResult::error(e),
+    };
+
+    if recall_result.results.is_empty() {
+        return CallToolResult::success("No items found matching your query.");
+    }
+
+    let results = &recall_result.results;
+
+    let formatted: Vec<Value> = results
+        .iter()
+        .map(|r| {
+            let mut obj = json!({
+                "id": r.id,
+                "content": r.content,
+                "similarity": format!("{:.2}", r.similarity),
+                "created": r.created_at.to_rfc3339(),
+            });
+
+            if let Some(ref excerpt) = r.relevant_excerpt {
+                obj["relevant_excerpt"] = json!(excerpt);
+            }
+            if !r.tags.is_empty() {
+                obj["tags"] = json!(r.tags);
+            }
+            if let Some(ref source) = r.source {
+                obj["source"] = json!(source);
             }
 
-            // Lazy graph backfill (Phase 2c): ensure nodes exist for all results
-            for result in &results {
-                let project_id = db.get_item(&result.id).await
-                    .ok()
-                    .flatten()
-                    .and_then(|item| item.project_id.clone());
-                let _ = graph.ensure_node_exists(
-                    &result.id,
-                    project_id.as_deref(),
-                    result.created_at.timestamp(),
-                );
-            }
-
-            // Fetch access records for decay scoring
-            let item_ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
-            let access_records = tracker.get_accesses(&item_ids).unwrap_or_default();
-
-            let now = chrono::Utc::now().timestamp();
-
-            // Re-score with decay + trust (Phase 4d)
-            for result in &mut results {
-                let created_at = result.created_at.timestamp();
-                let (access_count, last_accessed) = match access_records.get(&result.id) {
-                    Some(rec) => (rec.access_count, Some(rec.last_accessed_at)),
-                    None => (0, None),
-                };
-
-                let base_score = score_with_decay(
-                    result.similarity,
-                    now,
-                    created_at,
-                    access_count,
-                    last_accessed,
-                );
-
-                // Trust bonus: validation_count + edge_count
-                let validation_count = tracker.get_validation_count(&result.id).unwrap_or(0);
-                let edge_count = graph.get_edge_count(&result.id).unwrap_or(0);
-                let trust_bonus = 1.0
-                    + 0.05 * (1.0 + validation_count as f64).ln() as f32
-                    + 0.02 * edge_count as f32;
-
-                result.similarity = base_score * trust_bonus;
-            }
-
-            // Re-sort by decay-adjusted score
-            results.sort_by(|a, b| b.similarity.partial_cmp(&a.similarity).unwrap());
-
-            // Record access for returned items
-            for result in &results {
-                let created_at = result.created_at.timestamp();
-                let _ = tracker.record_access(&result.id, created_at);
-            }
-
-            // Graph-aware recall (Phase 2d): 1-hop expansion
-            let top_ids: Vec<&str> = results.iter().take(5).map(|r| r.id.as_str()).collect();
-            let existing_ids: std::collections::HashSet<String> =
-                results.iter().map(|r| r.id.clone()).collect();
-
-            let mut graph_expanded = Vec::new();
-            if let Ok(neighbors) = graph.get_neighbors(&top_ids, 0.5) {
-                for (neighbor_id, rel_type, _strength) in neighbors {
-                    if existing_ids.contains(&neighbor_id) {
-                        continue;
-                    }
-                    if let Ok(Some(item)) = db.get_item(&neighbor_id).await {
-                        let sr = crate::item::SearchResult::from_item(&item, 0.05); // small bonus
-                        graph_expanded.push(json!({
-                            "id": sr.id,
-                            "content": sr.content,
-                            "similarity": "graph",
-                            "created": sr.created_at.to_rfc3339(),
-                            "graph_expanded": true,
-                            "rel_type": rel_type,
-                        }));
-                    }
-                }
-            }
-
-            // Proactive suggestions (Phase 3b): co-accessed items
-            let mut suggested = Vec::new();
-            let top3_ids: Vec<&str> = results.iter().take(3).map(|r| r.id.as_str()).collect();
-            if let Ok(co_accessed) = graph.get_co_accessed(&top3_ids, 3) {
-                for (co_id, co_count) in co_accessed {
-                    if existing_ids.contains(&co_id) {
-                        continue;
-                    }
-                    if let Ok(Some(item)) = db.get_item(&co_id).await {
-                        suggested.push(json!({
-                            "id": item.id,
-                            "content": truncate(&item.content, 100),
-                            "reason": format!("frequently recalled with result (co-accessed {} times)", co_count),
-                        }));
-                    }
-                }
-            }
-
-            let formatted: Vec<Value> = results
-                .iter()
-                .map(|r| {
-                    let mut obj = json!({
-                        "id": r.id,
-                        "content": r.content,
-                        "similarity": format!("{:.2}", r.similarity),
-                        "created": r.created_at.to_rfc3339(),
-                    });
-
-                    if let Some(ref excerpt) = r.relevant_excerpt {
-                        obj["relevant_excerpt"] = json!(excerpt);
-                    }
-                    if !r.tags.is_empty() {
-                        obj["tags"] = json!(r.tags);
-                    }
-                    if let Some(ref source) = r.source {
-                        obj["source"] = json!(source);
-                    }
-
-                    // Cross-project flag (Phase 3c)
-                    if let Some(ref current_pid) = ctx.project_id {
-                        if let Ok(Some(item)) = futures::executor::block_on(db.get_item(&r.id)) {
-                            if let Some(ref item_pid) = item.project_id {
-                                if item_pid != current_pid {
-                                    obj["cross_project"] = json!(true);
-                                    // Try to get project_path from metadata provenance
-                                    if let Some(ref meta) = item.metadata {
-                                        if let Some(prov) = meta.get("_provenance") {
-                                            if let Some(pp) = prov.get("project_path") {
-                                                obj["project_path"] = pp.clone();
-                                            }
-                                        }
-                                    }
+            // Cross-project flag (Phase 3c) — uses cached project_id/metadata from SearchResult
+            if let Some(ref current_pid) = ctx.project_id {
+                if let Some(ref item_pid) = r.project_id {
+                    if item_pid != current_pid {
+                        obj["cross_project"] = json!(true);
+                        if let Some(ref meta) = r.metadata {
+                            if let Some(prov) = meta.get("_provenance") {
+                                if let Some(pp) = prov.get("project_path") {
+                                    obj["project_path"] = pp.clone();
                                 }
                             }
                         }
                     }
-
-                    // Related IDs from graph (Phase 1d)
-                    if let Ok(neighbors) = graph.get_neighbors(&[r.id.as_str()], 0.5) {
-                        let related: Vec<String> = neighbors
-                            .iter()
-                            .map(|(id, _, _)| id.clone())
-                            .collect();
-                        if !related.is_empty() {
-                            obj["related_ids"] = json!(related);
-                        }
-                    }
-
-                    obj
-                })
-                .collect();
-
-            let mut result_json = json!({
-                "count": results.len(),
-                "results": formatted
-            });
-
-            if !graph_expanded.is_empty() {
-                result_json["graph_expanded"] = json!(graph_expanded);
-            }
-
-            if !suggested.is_empty() {
-                result_json["suggested"] = json!(suggested);
-            }
-
-            // Fire-and-forget: background consolidation (Phase 2b)
-            spawn_consolidation(
-                Arc::new(ctx.db_path.clone()),
-                Arc::new(ctx.access_db_path.clone()),
-                Arc::new(ctx.graph_path.clone()),
-                ctx.project_id.clone(),
-                ctx.embedder.clone(),
-                ctx.consolidation_semaphore.clone(),
-            );
-
-            // Fire-and-forget: co-access recording (Phase 3a)
-            let result_ids: Vec<String> = results.iter().map(|r| r.id.clone()).collect();
-            let graph_path = ctx.graph_path.clone();
-            tokio::spawn(async move {
-                if let Ok(g) = GraphStore::open(&graph_path) {
-                    let _ = g.record_co_access(&result_ids);
                 }
-            });
-
-            // Periodic clustering (Phase 4b): every 10th consolidation run
-            let run_count = ctx.consolidation_run_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if run_count % 10 == 9 {
-                let graph_path = ctx.graph_path.clone();
-                tokio::spawn(async move {
-                    if let Ok(g) = GraphStore::open(&graph_path) {
-                        if let Ok(clusters) = g.detect_clusters() {
-                            for (a, b, c) in &clusters {
-                                let label = format!("cluster-{}", &a[..8.min(a.len())]);
-                                let _ = g.add_related_edge(a, b, 0.8, &label);
-                                let _ = g.add_related_edge(b, c, 0.8, &label);
-                                let _ = g.add_related_edge(a, c, 0.8, &label);
-                            }
-                            if !clusters.is_empty() {
-                                tracing::info!("Detected {} clusters", clusters.len());
-                            }
-                        }
-                    }
-                });
             }
 
-            CallToolResult::success(serde_json::to_string_pretty(&result_json).unwrap())
-        }
-        Err(e) => CallToolResult::error(format!("Search failed: {}", e)),
+            // Related IDs from graph (Phase 1d)
+            if let Ok(neighbors) = graph.get_neighbors(&[r.id.as_str()], 0.5) {
+                let related: Vec<String> = neighbors
+                    .iter()
+                    .map(|(id, _, _)| id.clone())
+                    .collect();
+                if !related.is_empty() {
+                    obj["related_ids"] = json!(related);
+                }
+            }
+
+            obj
+        })
+        .collect();
+
+    let mut result_json = json!({
+        "count": results.len(),
+        "results": formatted
+    });
+
+    if !recall_result.graph_expanded.is_empty() {
+        result_json["graph_expanded"] = json!(recall_result.graph_expanded);
     }
+
+    if !recall_result.suggested.is_empty() {
+        result_json["suggested"] = json!(recall_result.suggested);
+    }
+
+    // Fire-and-forget: background consolidation (Phase 2b)
+    spawn_consolidation(
+        Arc::new(ctx.db_path.clone()),
+        Arc::new(ctx.access_db_path.clone()),
+        ctx.project_id.clone(),
+        ctx.embedder.clone(),
+        ctx.consolidation_semaphore.clone(),
+    );
+
+    // Fire-and-forget: co-access recording (Phase 3a)
+    let result_ids: Vec<String> = results.iter().map(|r| r.id.clone()).collect();
+    let access_db_path = ctx.access_db_path.clone();
+    tokio::spawn(async move {
+        if let Ok(g) = GraphStore::open(&access_db_path) {
+            let _ = g.record_co_access(&result_ids);
+        }
+    });
+
+    // Periodic clustering (Phase 4b): every 10th consolidation run
+    let run_count = ctx.consolidation_run_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if run_count % 10 == 9 {
+        let access_db_path = ctx.access_db_path.clone();
+        tokio::spawn(async move {
+            if let Ok(g) = GraphStore::open(&access_db_path) {
+                if let Ok(clusters) = g.detect_clusters() {
+                    for (a, b, c) in &clusters {
+                        let label = format!("cluster-{}", &a[..8.min(a.len())]);
+                        let _ = g.add_related_edge(a, b, 0.8, &label);
+                        let _ = g.add_related_edge(b, c, 0.8, &label);
+                        let _ = g.add_related_edge(a, c, 0.8, &label);
+                    }
+                    if !clusters.is_empty() {
+                        tracing::info!("Detected {} clusters", clusters.len());
+                    }
+                }
+            }
+        });
+    }
+
+    CallToolResult::success(serde_json::to_string_pretty(&result_json).unwrap())
 }
 
 async fn execute_list(db: &mut Database, args: Option<Value>) -> CallToolResult {
@@ -827,6 +904,12 @@ async fn execute_connections(
 
     match graph.get_full_connections(&params.id) {
         Ok(connections) => {
+            // Batch fetch all connected items
+            let target_ids: Vec<&str> = connections.iter().map(|c| c.target_id.as_str()).collect();
+            let items = db.get_items_batch(&target_ids).await.unwrap_or_default();
+            let item_map: std::collections::HashMap<&str, &Item> =
+                items.iter().map(|item| (item.id.as_str(), item)).collect();
+
             let mut conn_json: Vec<Value> = Vec::new();
 
             for conn in &connections {
@@ -840,8 +923,8 @@ async fn execute_connections(
                     obj["count"] = json!(count);
                 }
 
-                // Add content preview
-                if let Ok(Some(item)) = db.get_item(&conn.target_id).await {
+                // Add content preview from batch
+                if let Some(item) = item_map.get(conn.target_id.as_str()) {
                     obj["content_preview"] = json!(truncate(&item.content, 80));
                 }
 

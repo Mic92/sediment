@@ -217,6 +217,12 @@ pub struct SearchResult {
     pub source: Option<String>,
     /// When created
     pub created_at: DateTime<Utc>,
+    /// Project ID (not serialized, used internally for cross-project checks and graph backfill)
+    #[serde(skip)]
+    pub project_id: Option<String>,
+    /// Metadata (not serialized, used internally for cross-project provenance)
+    #[serde(skip)]
+    pub metadata: Option<Value>,
 }
 
 impl SearchResult {
@@ -230,6 +236,8 @@ impl SearchResult {
             tags: item.tags.clone(),
             source: item.source.clone(),
             created_at: item.created_at,
+            project_id: item.project_id.clone(),
+            metadata: item.metadata.clone(),
         }
     }
 
@@ -247,6 +255,8 @@ impl SearchResult {
             tags: item.tags.clone(),
             source: item.source.clone(),
             created_at: item.created_at,
+            project_id: item.project_id.clone(),
+            metadata: item.metadata.clone(),
         }
     }
 }
