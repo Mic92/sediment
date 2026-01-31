@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -81,18 +81,73 @@ pub fn run(db_path: &Path, project_id: Option<String>) -> Result<()> {
     {
         let stdin = io::stdin();
         let mut stdout = io::stdout();
-        let reader = stdin.lock();
+        let mut reader = stdin.lock();
+
+        // Maximum line size to prevent OOM from a malicious client sending
+        // a single huge line without a newline character.
+        const MAX_LINE_BYTES: usize = 10 * 1024 * 1024; // 10 MB
 
         tracing::info!("MCP server ready, waiting for requests...");
 
-        for line in reader.lines() {
-            let line = line.context("Failed to read line")?;
+        let mut line = String::new();
+        loop {
+            line.clear();
+            // Use Read::take to bound memory before the newline is found.
+            // Without this, read_line would buffer an unlimited amount of data
+            // if the client never sends a newline character.
+            let bytes_read = (&mut reader)
+                .take((MAX_LINE_BYTES + 1) as u64)
+                .read_line(&mut line)
+                .context("Failed to read line")?;
+            if bytes_read == 0 {
+                break; // EOF
+            }
+
+            if line.len() > MAX_LINE_BYTES
+                || (line.len() >= MAX_LINE_BYTES && !line.ends_with('\n'))
+            {
+                tracing::error!(
+                    "Rejecting oversized request: {} bytes (max {})",
+                    line.len(),
+                    MAX_LINE_BYTES
+                );
+                // Drain remaining bytes until newline or EOF to resync the stream.
+                // Use a fixed-size buffer to avoid unbounded allocation from a
+                // malicious client that never sends a newline.
+                if !line.ends_with('\n') {
+                    let mut drain_buf = [0u8; 8192];
+                    loop {
+                        match reader.read(&mut drain_buf) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                if drain_buf[..n].contains(&b'\n') {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
+                let response = Response::error(None, INVALID_REQUEST, "Request too large");
+                let response_json = serde_json::to_string(&response)?;
+                writeln!(stdout, "{}", response_json)?;
+                stdout.flush()?;
+                continue;
+            }
 
             if line.trim().is_empty() {
                 continue;
             }
 
-            tracing::debug!("Received: {}", line);
+            tracing::debug!(
+                "Received: ({} bytes) {}",
+                line.len(),
+                if line.len() > 200 {
+                    &line[..200]
+                } else {
+                    &line
+                }
+            );
 
             // Handle request and get optional response (notifications don't get responses)
             if let Some(response) = handle_request(&rt, &ctx, &line) {
@@ -127,7 +182,7 @@ fn handle_request(rt: &Runtime, ctx: &ServerContext, line: &str) -> Option<Respo
             return Some(Response::error(
                 None,
                 PARSE_ERROR,
-                &format!("Parse error: {}", e),
+                "Parse error: invalid JSON-RPC request",
             ));
         }
     };
@@ -186,14 +241,22 @@ fn handle_initialize(id: Option<Value>) -> Response {
         },
     };
 
-    Response::success(id, serde_json::to_value(result).unwrap())
+    // InitializeResult is a simple struct; serialization is infallible.
+    Response::success(
+        id,
+        serde_json::to_value(result).expect("InitializeResult serialization"),
+    )
 }
 
 /// Handle tools/list request
 fn handle_list_tools(id: Option<Value>) -> Response {
     let result = ListToolsResult { tools: get_tools() };
 
-    Response::success(id, serde_json::to_value(result).unwrap())
+    // ListToolsResult is a simple struct; serialization is infallible.
+    Response::success(
+        id,
+        serde_json::to_value(result).expect("ListToolsResult serialization"),
+    )
 }
 
 /// Handle tools/call request
@@ -207,7 +270,8 @@ fn handle_call_tool(
         Some(p) => match serde_json::from_value(p) {
             Ok(p) => p,
             Err(e) => {
-                return Response::error(id, INVALID_PARAMS, &format!("Invalid params: {}", e));
+                tracing::debug!("Invalid tool call params: {}", e);
+                return Response::error(id, INVALID_PARAMS, "Invalid params");
             }
         },
         None => {
@@ -236,14 +300,22 @@ fn handle_call_tool(
         if state.count > MAX_CALLS_PER_MINUTE {
             let result =
                 super::protocol::CallToolResult::error("Rate limit exceeded, try again later");
-            return Response::success(id, serde_json::to_value(result).unwrap());
+            // CallToolResult is a simple struct; serialization is infallible.
+            return Response::success(
+                id,
+                serde_json::to_value(result).expect("CallToolResult serialization"),
+            );
         }
     }
 
     // Execute tool async with fresh DB connection and retry logic
     let result = rt.block_on(execute_tool(ctx, &params.name, params.arguments));
 
-    Response::success(id, serde_json::to_value(result).unwrap())
+    // CallToolResult is a simple struct; serialization is infallible.
+    Response::success(
+        id,
+        serde_json::to_value(result).expect("CallToolResult serialization"),
+    )
 }
 
 /// Handle ping request

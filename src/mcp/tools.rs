@@ -274,22 +274,22 @@ pub async fn execute_tool(ctx: &ServerContext, name: &str, args: Option<Value>) 
                 ctx_ref.embedder.clone(),
             )
             .await
-            .map_err(|e| format!("Failed to open database: {}", e))?;
+            .map_err(|e| sanitize_err("Failed to open database", e))?;
 
             // Open access tracker
             let tracker = AccessTracker::open(&ctx_ref.access_db_path)
-                .map_err(|e| format!("Failed to open access tracker: {}", e))?;
+                .map_err(|e| sanitize_err("Failed to open access tracker", e))?;
 
             // Open graph store (shares access.db)
             let graph = GraphStore::open(&ctx_ref.access_db_path)
-                .map_err(|e| format!("Failed to open graph store: {}", e))?;
+                .map_err(|e| sanitize_err("Failed to open graph store", e))?;
 
             let result = match name_ref {
                 "store" => execute_store(&mut db, &tracker, &graph, ctx_ref, args_clone).await,
                 "recall" => execute_recall(&mut db, &tracker, &graph, ctx_ref, args_clone).await,
                 "list" => execute_list(&mut db, args_clone).await,
-                "forget" => execute_forget(&mut db, &graph, args_clone).await,
-                "connections" => execute_connections(&mut db, &graph, args_clone).await,
+                "forget" => execute_forget(&mut db, &graph, ctx_ref, args_clone).await,
+                "connections" => execute_connections(&mut db, &graph, ctx_ref, args_clone).await,
                 _ => return Ok(CallToolResult::error(format!("Unknown tool: {}", name_ref))),
             };
 
@@ -307,7 +307,10 @@ pub async fn execute_tool(ctx: &ServerContext, name: &str, args: Option<Value>) 
 
     match result {
         Ok(call_result) => call_result,
-        Err(e) => CallToolResult::error(format!("Operation failed after retries: {}", e)),
+        Err(e) => {
+            tracing::error!("Operation failed after retries: {}", e);
+            CallToolResult::error("Operation failed after retries")
+        }
     }
 }
 
@@ -341,12 +344,17 @@ async fn execute_store(
     let params: StoreParams = match args {
         Some(v) => match serde_json::from_value(v) {
             Ok(p) => p,
-            Err(e) => return CallToolResult::error(format!("Invalid parameters: {}", e)),
+            Err(e) => {
+                tracing::debug!("Parameter validation failed: {}", e);
+                return CallToolResult::error("Invalid parameters");
+            }
         },
         None => return CallToolResult::error("Missing parameters"),
     };
 
-    // Reject oversized content to prevent OOM during embedding/chunking (1MB limit)
+    // Reject oversized content to prevent OOM during embedding/chunking.
+    // Intentionally byte-based (not char-based): memory allocation is proportional
+    // to byte length, so this is the correct metric for OOM prevention.
     const MAX_CONTENT_BYTES: usize = 1_000_000;
     if params.content.len() > MAX_CONTENT_BYTES {
         return CallToolResult::error(format!(
@@ -354,6 +362,62 @@ async fn execute_store(
             params.content.len(),
             MAX_CONTENT_BYTES
         ));
+    }
+
+    // Validate field sizes to prevent abuse
+    const MAX_TITLE_LEN: usize = 1000;
+    const MAX_SOURCE_LEN: usize = 2000;
+    const MAX_TAG_LEN: usize = 200;
+    const MAX_TAG_COUNT: usize = 50;
+    const MAX_METADATA_BYTES: usize = 100_000;
+
+    if let Some(ref title) = params.title
+        && title.len() > MAX_TITLE_LEN
+    {
+        return CallToolResult::error(format!(
+            "Title too large: {} bytes (max {})",
+            title.len(),
+            MAX_TITLE_LEN
+        ));
+    }
+
+    if let Some(ref source) = params.source
+        && source.len() > MAX_SOURCE_LEN
+    {
+        return CallToolResult::error(format!(
+            "Source too large: {} bytes (max {})",
+            source.len(),
+            MAX_SOURCE_LEN
+        ));
+    }
+
+    if let Some(ref tags) = params.tags {
+        if tags.len() > MAX_TAG_COUNT {
+            return CallToolResult::error(format!(
+                "Too many tags: {} (max {})",
+                tags.len(),
+                MAX_TAG_COUNT
+            ));
+        }
+        for tag in tags {
+            if tag.len() > MAX_TAG_LEN {
+                return CallToolResult::error(format!(
+                    "Tag too large: {} bytes (max {})",
+                    tag.len(),
+                    MAX_TAG_LEN
+                ));
+            }
+        }
+    }
+
+    if let Some(ref metadata) = params.metadata {
+        let meta_size = metadata.to_string().len();
+        if meta_size > MAX_METADATA_BYTES {
+            return CallToolResult::error(format!(
+                "Metadata too large: {} bytes (max {})",
+                meta_size, MAX_METADATA_BYTES
+            ));
+        }
     }
 
     // Parse scope
@@ -378,10 +442,22 @@ async fn execute_store(
         None
     };
 
-    // Validate that the item to replace exists (actual deletion deferred until after store)
+    // Validate that the item to replace exists and belongs to the current project
     let replaced_id = if let Some(ref replace_id) = params.replace {
         match db.get_item(replace_id).await {
-            Ok(Some(_)) => Some(replace_id.clone()),
+            Ok(Some(item)) => {
+                // Access control: prevent replacing items from other projects
+                if let Some(ref current_pid) = ctx.project_id
+                    && let Some(ref item_pid) = item.project_id
+                    && item_pid != current_pid
+                {
+                    return CallToolResult::error(format!(
+                        "Cannot replace item {} from a different project",
+                        replace_id
+                    ));
+                }
+                Some(replace_id.clone())
+            }
             Ok(None) => {
                 return CallToolResult::error(format!(
                     "Cannot replace: item not found: {}",
@@ -389,7 +465,7 @@ async fn execute_store(
                 ));
             }
             Err(e) => {
-                return CallToolResult::error(format!("Failed to look up item for replace: {}", e));
+                return sanitized_error("Failed to look up item for replace", e);
             }
         }
     } else {
@@ -472,8 +548,10 @@ async fn execute_store(
                 tracing::warn!("graph add_node failed: {}", e);
             }
 
-            // Complete replace: now that the new item is stored, delete the old one
-            // (store-before-delete ensures no data loss on crash)
+            // Complete replace: now that the new item is stored, delete the old one.
+            // Intentionally non-atomic (store-before-delete): if the process crashes
+            // between store and delete, both items exist (benign duplication, not data
+            // loss). The consolidation system will detect and merge duplicates.
             if let Some(ref old_id) = replaced_id {
                 // Record validation on the NEW item (the replacement is a "confirmed" version)
                 let now_ts = chrono::Utc::now().timestamp();
@@ -487,10 +565,9 @@ async fn execute_store(
                     // Compensating action: remove the new item since replace failed
                     let _ = db.delete_item(&new_id).await;
                     let _ = graph.remove_node(&new_id);
-                    return CallToolResult::error(format!(
-                        "Replace failed during edge transfer: {}. Original item preserved.",
-                        e
-                    ));
+                    return CallToolResult::error(
+                        "Replace failed during edge transfer. Original item preserved.",
+                    );
                 }
                 // Create SUPERSEDES edge (non-critical, continue on failure)
                 if let Err(e) = graph.add_supersedes_edge(&new_id, old_id) {
@@ -567,7 +644,7 @@ async fn execute_store(
                     .unwrap_or_else(|e| format!("{{\"error\": \"serialization failed: {}\"}}", e)),
             )
         }
-        Err(e) => CallToolResult::error(format!("Failed to store: {}", e)),
+        Err(e) => sanitized_error("Failed to store item", e),
     }
 }
 
@@ -682,14 +759,25 @@ pub async fn recall_pipeline(
                 for (neighbor_id, rel_type) in &neighbor_info {
                     if let Some(item) = item_map.get(neighbor_id.as_str()) {
                         let sr = crate::item::SearchResult::from_item(item, 0.05);
-                        graph_expanded.push(json!({
+                        let mut entry = json!({
                             "id": sr.id,
-                            "content": sr.content,
                             "similarity": "graph",
                             "created": sr.created_at.to_rfc3339(),
                             "graph_expanded": true,
                             "rel_type": rel_type,
-                        }));
+                        });
+                        // Only include content for same-project or global items
+                        let same_project = match (db.project_id(), item.project_id.as_deref()) {
+                            (Some(current), Some(item_pid)) => current == item_pid,
+                            (_, None) => true,
+                            _ => false,
+                        };
+                        if same_project {
+                            entry["content"] = json!(sr.content);
+                        } else {
+                            entry["cross_project"] = json!(true);
+                        }
+                        graph_expanded.push(entry);
                     }
                 }
             }
@@ -713,11 +801,21 @@ pub async fn recall_pipeline(
 
                 for (co_id, co_count) in &co_info {
                     if let Some(item) = item_map.get(co_id.as_str()) {
-                        suggested.push(json!({
+                        let same_project = match (db.project_id(), item.project_id.as_deref()) {
+                            (Some(current), Some(item_pid)) => current == item_pid,
+                            (_, None) => true,
+                            _ => false,
+                        };
+                        let mut entry = json!({
                             "id": item.id,
-                            "content": truncate(&item.content, 100),
                             "reason": format!("frequently recalled with result (co-accessed {} times)", co_count),
-                        }));
+                        });
+                        if same_project {
+                            entry["content"] = json!(truncate(&item.content, 100));
+                        } else {
+                            entry["cross_project"] = json!(true);
+                        }
+                        suggested.push(entry);
                     }
                 }
             }
@@ -742,7 +840,10 @@ async fn execute_recall(
     let params: RecallParams = match args {
         Some(v) => match serde_json::from_value(v) {
             Ok(p) => p,
-            Err(e) => return CallToolResult::error(format!("Invalid parameters: {}", e)),
+            Err(e) => {
+                tracing::debug!("Parameter validation failed: {}", e);
+                return CallToolResult::error("Invalid parameters");
+            }
         },
         None => return CallToolResult::error("Missing parameters"),
     };
@@ -771,7 +872,10 @@ async fn execute_recall(
     let recall_result =
         match recall_pipeline(db, tracker, graph, &params.query, limit, filters, &config).await {
             Ok(r) => r,
-            Err(e) => return CallToolResult::error(e),
+            Err(e) => {
+                tracing::error!("Recall failed: {}", e);
+                return CallToolResult::error("Search failed");
+            }
         };
 
     if recall_result.results.is_empty() {
@@ -998,22 +1102,46 @@ async fn execute_list(db: &mut Database, args: Option<Value>) -> CallToolResult 
                 )
             }
         }
-        Err(e) => CallToolResult::error(format!("Failed to list items: {}", e)),
+        Err(e) => sanitized_error("Failed to list items", e),
     }
 }
 
 async fn execute_forget(
     db: &mut Database,
     graph: &GraphStore,
+    ctx: &ServerContext,
     args: Option<Value>,
 ) -> CallToolResult {
     let params: ForgetParams = match args {
         Some(v) => match serde_json::from_value(v) {
             Ok(p) => p,
-            Err(e) => return CallToolResult::error(format!("Invalid parameters: {}", e)),
+            Err(e) => {
+                tracing::debug!("Parameter validation failed: {}", e);
+                return CallToolResult::error("Invalid parameters");
+            }
         },
         None => return CallToolResult::error("Missing parameters"),
     };
+
+    // Access control: verify the item belongs to the current project (or is global)
+    if let Some(ref current_pid) = ctx.project_id {
+        match db.get_item(&params.id).await {
+            Ok(Some(item)) => {
+                if let Some(ref item_pid) = item.project_id
+                    && item_pid != current_pid
+                {
+                    return CallToolResult::error(format!(
+                        "Cannot delete item {} from a different project",
+                        params.id
+                    ));
+                }
+            }
+            Ok(None) => return CallToolResult::error(format!("Item not found: {}", params.id)),
+            Err(e) => {
+                return sanitized_error("Failed to look up item", e);
+            }
+        }
+    }
 
     match db.delete_item(&params.id).await {
         Ok(true) => {
@@ -1032,28 +1160,42 @@ async fn execute_forget(
             )
         }
         Ok(false) => CallToolResult::error(format!("Item not found: {}", params.id)),
-        Err(e) => CallToolResult::error(format!("Failed to delete: {}", e)),
+        Err(e) => sanitized_error("Failed to delete item", e),
     }
 }
 
 async fn execute_connections(
     db: &mut Database,
     graph: &GraphStore,
+    ctx: &ServerContext,
     args: Option<Value>,
 ) -> CallToolResult {
     let params: ConnectionsParams = match args {
         Some(v) => match serde_json::from_value(v) {
             Ok(p) => p,
-            Err(e) => return CallToolResult::error(format!("Invalid parameters: {}", e)),
+            Err(e) => {
+                tracing::debug!("Parameter validation failed: {}", e);
+                return CallToolResult::error("Invalid parameters");
+            }
         },
         None => return CallToolResult::error("Missing parameters"),
     };
 
-    // Verify item exists
+    // Verify item exists and belongs to the current project
     match db.get_item(&params.id).await {
+        Ok(Some(item)) => {
+            if let Some(ref current_pid) = ctx.project_id
+                && let Some(ref item_pid) = item.project_id
+                && item_pid != current_pid
+            {
+                return CallToolResult::error(format!(
+                    "Cannot view connections for item {} from a different project",
+                    params.id
+                ));
+            }
+        }
         Ok(None) => return CallToolResult::error(format!("Item not found: {}", params.id)),
-        Err(e) => return CallToolResult::error(format!("Failed to get item: {}", e)),
-        Ok(Some(_)) => {}
+        Err(e) => return sanitized_error("Failed to get item", e),
     }
 
     match graph.get_full_connections(&params.id) {
@@ -1077,9 +1219,20 @@ async fn execute_connections(
                     obj["count"] = json!(count);
                 }
 
-                // Add content preview from batch
+                // Add content preview from batch, but only if the connected item
+                // belongs to the same project (or is global). This prevents
+                // cross-project content leakage via graph edges.
                 if let Some(item) = item_map.get(conn.target_id.as_str()) {
-                    obj["content_preview"] = json!(truncate(&item.content, 80));
+                    let same_project = match (&ctx.project_id, &item.project_id) {
+                        (Some(current), Some(item_pid)) => current == item_pid,
+                        (_, None) => true, // Global items are visible to all
+                        _ => false,
+                    };
+                    if same_project {
+                        obj["content_preview"] = json!(truncate(&item.content, 80));
+                    } else {
+                        obj["cross_project"] = json!(true);
+                    }
                 }
 
                 conn_json.push(obj);
@@ -1095,11 +1248,24 @@ async fn execute_connections(
                     .unwrap_or_else(|e| format!("{{\"error\": \"serialization failed: {}\"}}", e)),
             )
         }
-        Err(e) => CallToolResult::error(format!("Failed to get connections: {}", e)),
+        Err(e) => sanitized_error("Failed to get connections", e),
     }
 }
 
 // ========== Utilities ==========
+
+/// Log a detailed internal error and return a sanitized message to the MCP client.
+/// This prevents leaking file paths, database internals, or OS details.
+fn sanitized_error(context: &str, err: impl std::fmt::Display) -> CallToolResult {
+    tracing::error!("{}: {}", context, err);
+    CallToolResult::error(context.to_string())
+}
+
+/// Like `sanitized_error` but returns a String for use inside `map_err` chains.
+fn sanitize_err(context: &str, err: impl std::fmt::Display) -> String {
+    tracing::error!("{}: {}", context, err);
+    context.to_string()
+}
 
 fn truncate(s: &str, max_len: usize) -> String {
     if s.chars().count() <= max_len {

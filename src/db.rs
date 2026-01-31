@@ -6,10 +6,29 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// Sanitize a string value for use in LanceDB SQL filter expressions
-/// by escaping backslashes and single quotes to prevent injection attacks.
+/// Sanitize a string value for use in LanceDB SQL filter expressions.
+///
+/// LanceDB uses DataFusion as its SQL engine. Since `only_if()` doesn't support
+/// parameterized queries, we must escape string literals. This function handles:
+/// - Null bytes: stripped (could truncate strings in some parsers)
+/// - Backslashes: escaped to prevent escape sequence injection
+/// - Single quotes: doubled per SQL standard
+/// - Semicolons: stripped to prevent statement injection
+/// - Comment sequences: `--` and `/*` stripped to prevent comment injection
 fn sanitize_sql_string(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('\'', "''")
+    s.replace('\0', "")
+        .replace('\\', "\\\\")
+        .replace('\'', "''")
+        .replace(';', "")
+        .replace("--", "")
+        .replace("/*", "")
+}
+
+/// Validate that a string looks like a valid item/project ID (UUID hex + hyphens).
+/// Returns true if the string only contains safe characters for SQL interpolation.
+/// Use this as an additional guard before `sanitize_sql_string` for ID fields.
+fn is_valid_id(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 64 && s.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
 }
 
 use arrow_array::{
@@ -39,6 +58,11 @@ const CONFLICT_SIMILARITY_THRESHOLD: f32 = 0.85;
 
 /// Maximum number of conflicts to return
 const CONFLICT_SEARCH_LIMIT: usize = 5;
+
+/// Maximum number of chunks per item to prevent CPU exhaustion during embedding.
+/// With default config (800 char chunks), 1MB content produces ~1250 chunks.
+/// Cap at 200 to bound embedding time while covering most legitimate content.
+const MAX_CHUNKS_PER_ITEM: usize = 200;
 
 /// Database wrapper for LanceDB
 pub struct Database {
@@ -318,7 +342,17 @@ impl Database {
             // Detect content type for smart chunking
             let content_type = detect_content_type(&item.content);
             let config = ChunkingConfig::default();
-            let chunk_results = chunk_content(&item.content, content_type, &config);
+            let mut chunk_results = chunk_content(&item.content, content_type, &config);
+
+            // Cap chunk count to prevent CPU exhaustion from pathological inputs
+            if chunk_results.len() > MAX_CHUNKS_PER_ITEM {
+                tracing::warn!(
+                    "Chunk count {} exceeds limit {}, truncating",
+                    chunk_results.len(),
+                    MAX_CHUNKS_PER_ITEM
+                );
+                chunk_results.truncate(MAX_CHUNKS_PER_ITEM);
+            }
 
             for (i, chunk_result) in chunk_results.iter().enumerate() {
                 let mut chunk = Chunk::new(&item.id, i, &chunk_result.content);
@@ -688,6 +722,9 @@ impl Database {
 
     /// Get an item by ID
     pub async fn get_item(&self, id: &str) -> Result<Option<Item>> {
+        if !is_valid_id(id) {
+            return Ok(None);
+        }
         let table = match &self.items_table {
             Some(t) => t,
             None => return Ok(None),
@@ -727,8 +764,12 @@ impl Database {
 
         let quoted: Vec<String> = ids
             .iter()
+            .filter(|id| is_valid_id(id))
             .map(|id| format!("'{}'", sanitize_sql_string(id)))
             .collect();
+        if quoted.is_empty() {
+            return Ok(Vec::new());
+        }
         let filter = format!("id IN ({})", quoted.join(", "));
 
         let results = table
@@ -755,6 +796,9 @@ impl Database {
     /// Uses delete-then-insert because both rows share the same ID. If the
     /// re-insert fails, retries up to 3 times to avoid data loss.
     pub async fn expire_item(&self, id: &str, expires_at: chrono::DateTime<Utc>) -> Result<()> {
+        if !is_valid_id(id) {
+            return Err(SedimentError::Database("Invalid item ID".to_string()));
+        }
         let table = match &self.items_table {
             Some(t) => t,
             None => return Err(SedimentError::Database("Items table not found".to_string())),
@@ -819,6 +863,9 @@ impl Database {
     /// Delete an item and its chunks.
     /// Returns `true` if the item existed, `false` if it was not found.
     pub async fn delete_item(&self, id: &str) -> Result<bool> {
+        if !is_valid_id(id) {
+            return Ok(false);
+        }
         // Check if item exists first
         let table = match &self.items_table {
             Some(t) => t,
@@ -1379,11 +1426,68 @@ mod tests {
 
     #[test]
     fn test_sanitize_sql_string_escapes_quotes_and_backslashes() {
-        // Fix #3: Backslashes should be escaped too
         assert_eq!(sanitize_sql_string("hello"), "hello");
         assert_eq!(sanitize_sql_string("it's"), "it''s");
         assert_eq!(sanitize_sql_string(r"a\'b"), r"a\\''b");
         assert_eq!(sanitize_sql_string(r"path\to\file"), r"path\\to\\file");
+    }
+
+    #[test]
+    fn test_sanitize_sql_string_strips_null_bytes() {
+        assert_eq!(sanitize_sql_string("abc\0def"), "abcdef");
+        assert_eq!(sanitize_sql_string("\0' OR 1=1 --"), "'' OR 1=1 ");
+        assert_eq!(sanitize_sql_string("clean"), "clean");
+    }
+
+    #[test]
+    fn test_sanitize_sql_string_strips_semicolons() {
+        assert_eq!(
+            sanitize_sql_string("a; DROP TABLE items"),
+            "a DROP TABLE items"
+        );
+        assert_eq!(sanitize_sql_string("normal;"), "normal");
+    }
+
+    #[test]
+    fn test_sanitize_sql_string_strips_comments() {
+        // Line comments (-- stripped, leaving extra space)
+        assert_eq!(sanitize_sql_string("val' -- comment"), "val''  comment");
+        // Block comments (/* stripped, leaving extra space)
+        assert_eq!(sanitize_sql_string("val' /* block */"), "val''  block */");
+        // Nested attempts
+        assert_eq!(sanitize_sql_string("a--b--c"), "abc");
+    }
+
+    #[test]
+    fn test_sanitize_sql_string_adversarial_inputs() {
+        // Classic SQL injection
+        assert_eq!(
+            sanitize_sql_string("'; DROP TABLE items;--"),
+            "'' DROP TABLE items"
+        );
+        // Unicode escapes (should pass through harmlessly)
+        assert_eq!(
+            sanitize_sql_string("hello\u{200B}world"),
+            "hello\u{200B}world"
+        );
+        // Empty string
+        assert_eq!(sanitize_sql_string(""), "");
+        // Only special chars
+        assert_eq!(sanitize_sql_string("\0;\0"), "");
+    }
+
+    #[test]
+    fn test_is_valid_id() {
+        // Valid UUIDs
+        assert!(is_valid_id("550e8400-e29b-41d4-a716-446655440000"));
+        assert!(is_valid_id("abcdef0123456789"));
+        // Invalid
+        assert!(!is_valid_id(""));
+        assert!(!is_valid_id("'; DROP TABLE items;--"));
+        assert!(!is_valid_id("hello world"));
+        assert!(!is_valid_id("abc\0def"));
+        // Too long
+        assert!(!is_valid_id(&"a".repeat(65)));
     }
 
     #[test]

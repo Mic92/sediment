@@ -218,12 +218,55 @@ fn download_model(model_id: &str) -> Result<(PathBuf, PathBuf, PathBuf)> {
         .get("config.json")
         .map_err(|e| SedimentError::ModelLoading(format!("Failed to download config: {}", e)))?;
 
-    // Integrity is ensured by the pinned git revision above.
-    // TOFU sidecar hashes were removed as they provide no additional security:
-    // both the model and hash files share the same directory permissions,
-    // so an attacker who can modify one can modify the other.
+    // Verify integrity of all model files using hardcoded SHA-256 hashes.
+    // This protects against cache poisoning where an attacker modifies files
+    // in ~/.cache/huggingface/ after download. The hashes are compile-time
+    // constants tied to the pinned git revision above.
+    verify_all_model_files(&model_path, &tokenizer_path, &config_path)?;
 
     Ok((model_path, tokenizer_path, config_path))
+}
+
+/// Expected SHA-256 hashes for the pinned revision.
+const MODEL_SHA256: &str = "53aa51172d142c89d9012cce15ae4d6cc0ca6895895114379cacb4fab128d9db";
+const TOKENIZER_SHA256: &str = "be50c3628f2bf5bb5e3a7f17b1f74611b2561a3a27eeab05e5aa30f411572037";
+const CONFIG_SHA256: &str = "953f9c0d463486b10a6871cc2fd59f223b2c70184f49815e7efbcab5d8908b41";
+
+/// Verify the SHA-256 hash of a file against an expected value.
+fn verify_file_hash(path: &std::path::Path, expected: &str, file_label: &str) -> Result<()> {
+    use sha2::{Digest, Sha256};
+
+    let file_bytes = std::fs::read(path).map_err(|e| {
+        SedimentError::ModelLoading(format!(
+            "Failed to read {} for hash verification: {}",
+            file_label, e
+        ))
+    })?;
+
+    let hash = Sha256::digest(&file_bytes);
+    let hex_hash = format!("{:x}", hash);
+
+    if hex_hash != expected {
+        return Err(SedimentError::ModelLoading(format!(
+            "{} integrity check failed: expected SHA-256 {}, got {}",
+            file_label, expected, hex_hash
+        )));
+    }
+
+    Ok(())
+}
+
+/// Verify integrity of all model files (model weights, tokenizer, config).
+fn verify_all_model_files(
+    model_path: &std::path::Path,
+    tokenizer_path: &std::path::Path,
+    config_path: &std::path::Path,
+) -> Result<()> {
+    verify_file_hash(model_path, MODEL_SHA256, "model.safetensors")?;
+    verify_file_hash(tokenizer_path, TOKENIZER_SHA256, "tokenizer.json")?;
+    verify_file_hash(config_path, CONFIG_SHA256, "config.json")?;
+    info!("All model files integrity verified (SHA-256)");
+    Ok(())
 }
 
 /// L2 normalize a tensor
