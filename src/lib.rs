@@ -170,13 +170,6 @@ pub fn get_or_create_project_id(project_root: &Path) -> std::io::Result<String> 
         serde_json::to_string_pretty(&config).map_err(|e| std::io::Error::other(e.to_string()))?;
     std::fs::write(&config_path, &content)?;
 
-    // Restrict permissions on Unix
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600))?;
-    }
-
     Ok(config.project_id)
 }
 
@@ -226,8 +219,9 @@ pub fn find_project_root(start: &Path) -> Option<PathBuf> {
             return Some(current);
         }
 
-        // Move to parent directory
+        // Move to parent directory; stop at filesystem root
         match current.parent() {
+            Some(parent) if parent == current => return None,
             Some(parent) => current = parent.to_path_buf(),
             None => return None,
         }
