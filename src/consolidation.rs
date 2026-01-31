@@ -182,7 +182,9 @@ async fn run_consolidation_batch(
         let result = process_candidate(&mut db, access_db_path, candidate).await;
         match result {
             Ok(status) => {
-                if let Err(e) = queue.mark_processed(&candidate.item_id_a, &candidate.item_id_b, &status) {
+                if let Err(e) =
+                    queue.mark_processed(&candidate.item_id_a, &candidate.item_id_b, &status)
+                {
                     tracing::warn!("mark_processed failed: {}", e);
                 }
                 info!(
@@ -238,7 +240,8 @@ async fn process_candidate(
                 // The edge label stores a truncated snapshot; full content is
                 // preserved in the SUPERSEDES relationship for audit.
                 let archive_preview = if remove.content.chars().count() > 500 {
-                    let cut = remove.content
+                    let cut = remove
+                        .content
                         .char_indices()
                         .nth(497)
                         .map(|(i, _)| i)

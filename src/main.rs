@@ -336,7 +336,11 @@ fn run_list(db_override: Option<PathBuf>, limit: usize) -> Result<()> {
                 .take(80)
                 .collect::<String>()
                 .replace('\n', " ");
-            let ellipsis = if item.content.chars().count() > 80 { "..." } else { "" };
+            let ellipsis = if item.content.chars().count() > 80 {
+                "..."
+            } else {
+                ""
+            };
             println!("    Content: {}{}", content_preview, ellipsis);
             println!();
         }

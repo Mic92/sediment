@@ -247,8 +247,9 @@ fn verify_tofu_hash(file_path: &Path, label: &str) -> Result<()> {
         }
         info!("TOFU hash verified for {}", label);
     } else {
-        std::fs::write(&hash_path, &current_hash)
-            .map_err(|e| SedimentError::ModelLoading(format!("Failed to write hash file: {}", e)))?;
+        std::fs::write(&hash_path, &current_hash).map_err(|e| {
+            SedimentError::ModelLoading(format!("Failed to write hash file: {}", e))
+        })?;
         info!("TOFU hash recorded for {}: {}", label, current_hash);
     }
 

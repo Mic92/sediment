@@ -1057,12 +1057,20 @@ fn batch_to_items(batch: &RecordBatch) -> Result<Vec<Item>> {
             if c.is_null(i) {
                 None
             } else {
-                Some(Utc.timestamp_opt(c.value(i), 0).single().unwrap_or_else(Utc::now))
+                Some(
+                    Utc.timestamp_opt(c.value(i), 0)
+                        .single()
+                        .unwrap_or_else(Utc::now),
+                )
             }
         });
 
         let created_at = created_at_col
-            .map(|c| Utc.timestamp_opt(c.value(i), 0).single().unwrap_or_else(Utc::now))
+            .map(|c| {
+                Utc.timestamp_opt(c.value(i), 0)
+                    .single()
+                    .unwrap_or_else(Utc::now)
+            })
             .unwrap_or_else(Utc::now);
 
         let item = Item {

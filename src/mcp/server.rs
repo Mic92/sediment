@@ -213,7 +213,8 @@ fn handle_call_tool(
         } else {
             let count = ctx.rate_limit_count.fetch_add(1, Ordering::Relaxed) + 1;
             if count > MAX_CALLS_PER_MINUTE {
-                let result = super::protocol::CallToolResult::error("Rate limit exceeded, try again later");
+                let result =
+                    super::protocol::CallToolResult::error("Rate limit exceeded, try again later");
                 return Response::success(id, serde_json::to_value(result).unwrap());
             }
         }
