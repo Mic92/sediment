@@ -194,7 +194,11 @@ fn download_model(model_id: &str) -> Result<(PathBuf, PathBuf, PathBuf)> {
         .build()
         .map_err(|e| SedimentError::ModelLoading(format!("Failed to create HF API: {}", e)))?;
 
-    let repo = api.repo(Repo::new(model_id.to_string(), RepoType::Model));
+    let repo = api.repo(Repo::with_revision(
+        model_id.to_string(),
+        RepoType::Model,
+        "e4ce9877abf3edfe10b0d82785e83bdcb973e22e".to_string(),
+    ));
 
     let model_path = repo
         .get("model.safetensors")
