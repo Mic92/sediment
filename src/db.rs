@@ -826,9 +826,6 @@ impl Database {
         let mut results_map: std::collections::HashMap<String, (SearchResult, f32)> =
             std::collections::HashMap::new();
 
-        // FTS ranking for hybrid retrieval (hoisted for use in final RRF sort)
-        let mut fts_ranking: Option<std::collections::HashMap<String, usize>> = None;
-
         // Search items table directly (for non-chunked items and chunked items)
         if let Some(table) = &self.items_table {
             let row_count = table.count_rows(None).await.unwrap_or(0);
@@ -869,13 +866,19 @@ impl Database {
             }
 
             // Run FTS search for keyword-based ranking signal
-            fts_ranking = self.fts_rank_items(table, query, limit * 2).await;
+            let fts_ranking = self.fts_rank_items(table, query, limit * 2).await;
 
-            // Store items with project-boosted similarity (no FTS boost here;
-            // RRF fusion happens after chunks are merged)
+            // Apply additive FTS boost before project boosting.
+            // FTS rank 0 gets at most +0.08 similarity — enough to re-rank
+            // near-ties but not enough to override strong semantic signals.
             for (item, similarity) in vector_items {
+                let fts_boost = fts_ranking.as_ref().map_or(0.0, |ranks| {
+                    ranks
+                        .get(&item.id)
+                        .map_or(0.0, |&fts_rank| 0.08 / (1.0 + fts_rank as f32))
+                });
                 let boosted_similarity = boost_similarity(
-                    similarity,
+                    similarity + fts_boost,
                     item.project_id.as_deref(),
                     self.project_id.as_deref(),
                 );
@@ -965,37 +968,16 @@ impl Database {
             }
         }
 
-        // Reciprocal Rank Fusion: combine vector similarity ranking with FTS ranking.
-        // RRF score = 1/(k + vector_rank) + 1/(k + fts_rank), where k=60 is the
-        // standard constant from Cormack et al. (2009). This replaces the previous
-        // hand-tuned additive boost with a principled rank fusion method.
-        const RRF_K: f32 = 60.0;
-
-        // Sort by similarity to assign vector ranks (0 = best)
-        let mut ranked: Vec<(SearchResult, f32)> = results_map.into_values().collect();
-        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        // Compute RRF scores
-        let mut rrf_scored: Vec<(SearchResult, f32)> = ranked
-            .into_iter()
-            .enumerate()
-            .map(|(vector_rank, (sr, _sim))| {
-                let vector_rrf = 1.0 / (RRF_K + vector_rank as f32);
-                let fts_rrf = fts_ranking.as_ref().map_or(0.0, |ranks| {
-                    ranks.get(&sr.id).map_or(0.0, |&r| 1.0 / (RRF_K + r as f32))
-                });
-                (sr, vector_rrf + fts_rrf)
-            })
-            .collect();
-
-        // Sort by RRF score for final ranking and truncation
-        rrf_scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        let search_results: Vec<SearchResult> = rrf_scored
-            .into_iter()
-            .take(limit)
-            .map(|(sr, _)| sr)
-            .collect();
+        // Sort by boosted similarity (which already includes FTS boost + project boost)
+        // and truncate to the requested limit.
+        let mut search_results: Vec<SearchResult> =
+            results_map.into_values().map(|(sr, _)| sr).collect();
+        search_results.sort_by(|a, b| {
+            b.similarity
+                .partial_cmp(&a.similarity)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        search_results.truncate(limit);
 
         Ok(search_results)
     }
