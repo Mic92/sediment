@@ -18,6 +18,15 @@ pub struct AccessRecord {
     pub created_at: i64,
 }
 
+/// Combined access and validation data for decay scoring.
+#[derive(Debug, Clone)]
+pub struct DecayData {
+    pub access_count: u32,
+    pub last_accessed_at: i64,
+    pub created_at: i64,
+    pub validation_count: u32,
+}
+
 /// Tracks item access history in SQLite for decay scoring.
 pub struct AccessTracker {
     conn: Connection,
@@ -146,6 +155,57 @@ impl AccessTracker {
                 SedimentError::Database(format!("Failed to read validation count: {}", e))
             })?;
             map.insert(id, count);
+        }
+
+        Ok(map)
+    }
+
+    /// Get combined access and validation data for decay scoring in a single query.
+    pub fn get_decay_data(&self, item_ids: &[&str]) -> Result<HashMap<String, DecayData>> {
+        if item_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let placeholders: Vec<String> = item_ids
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 1))
+            .collect();
+        let sql = format!(
+            "SELECT item_id, access_count, last_accessed_at, created_at, COALESCE(validation_count, 0) FROM access_log WHERE item_id IN ({})",
+            placeholders.join(", ")
+        );
+
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(|e| SedimentError::Database(format!("Failed to prepare query: {}", e)))?;
+
+        let params: Vec<&dyn rusqlite::types::ToSql> = item_ids
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
+
+        let rows = stmt
+            .query_map(params.as_slice(), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    DecayData {
+                        access_count: row.get::<_, u32>(1)?,
+                        last_accessed_at: row.get::<_, i64>(2)?,
+                        created_at: row.get::<_, i64>(3)?,
+                        validation_count: row.get::<_, u32>(4)?,
+                    },
+                ))
+            })
+            .map_err(|e| SedimentError::Database(format!("Failed to query decay data: {}", e)))?;
+
+        let mut map = HashMap::new();
+        for row in rows {
+            let (id, data) = row.map_err(|e| {
+                SedimentError::Database(format!("Failed to read decay data: {}", e))
+            })?;
+            map.insert(id, data);
         }
 
         Ok(map)

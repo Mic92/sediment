@@ -428,8 +428,7 @@ pub async fn recall_pipeline(
         std::collections::HashMap::new();
     if config.enable_decay_scoring {
         let item_ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
-        let access_records = tracker.get_accesses(&item_ids).unwrap_or_default();
-        let validation_counts = tracker.get_validation_counts(&item_ids).unwrap_or_default();
+        let decay_data = tracker.get_decay_data(&item_ids).unwrap_or_default();
         let edge_counts = graph.get_edge_counts(&item_ids).unwrap_or_default();
         let now = chrono::Utc::now().timestamp();
 
@@ -437,9 +436,13 @@ pub async fn recall_pipeline(
             raw_similarities.insert(result.id.clone(), result.similarity);
 
             let created_at = result.created_at.timestamp();
-            let (access_count, last_accessed) = match access_records.get(&result.id) {
-                Some(rec) => (rec.access_count, Some(rec.last_accessed_at)),
-                None => (0, None),
+            let (access_count, last_accessed, validation_count) = match decay_data.get(&result.id) {
+                Some(data) => (
+                    data.access_count,
+                    Some(data.last_accessed_at),
+                    data.validation_count,
+                ),
+                None => (0, None, 0),
             };
 
             let base_score = score_with_decay(
@@ -450,7 +453,6 @@ pub async fn recall_pipeline(
                 last_accessed,
             );
 
-            let validation_count = validation_counts.get(&result.id).copied().unwrap_or(0);
             let edge_count = edge_counts.get(&result.id).copied().unwrap_or(0);
             let trust_bonus =
                 1.0 + 0.05 * (1.0 + validation_count as f64).ln() as f32 + 0.02 * edge_count as f32;
