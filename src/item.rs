@@ -43,8 +43,15 @@ impl Item {
         self
     }
 
-    /// Set the embedding
+    /// Set the embedding. Panics if dimensions don't match [`EMBEDDING_DIM`](crate::EMBEDDING_DIM).
     pub fn with_embedding(mut self, embedding: Vec<f32>) -> Self {
+        assert_eq!(
+            embedding.len(),
+            crate::embedder::EMBEDDING_DIM,
+            "embedding dimension mismatch: expected {}, got {}",
+            crate::embedder::EMBEDDING_DIM,
+            embedding.len()
+        );
         self.embedding = embedding;
         self
     }
@@ -112,8 +119,15 @@ impl Chunk {
         self
     }
 
-    /// Set the embedding
+    /// Set the embedding. Panics if dimensions don't match [`EMBEDDING_DIM`](crate::EMBEDDING_DIM).
     pub fn with_embedding(mut self, embedding: Vec<f32>) -> Self {
+        assert_eq!(
+            embedding.len(),
+            crate::embedder::EMBEDDING_DIM,
+            "embedding dimension mismatch: expected {}, got {}",
+            crate::embedder::EMBEDDING_DIM,
+            embedding.len()
+        );
         self.embedding = embedding;
         self
     }

@@ -213,17 +213,18 @@ pub async fn execute_tool(ctx: &ServerContext, name: &str, args: Option<Value>) 
             .await
             .map_err(|e| sanitize_err("Failed to open database", e))?;
 
-            // Open access tracker
-            let tracker = AccessTracker::open(&ctx_ref.access_db_path)
-                .map_err(|e| sanitize_err("Failed to open access tracker", e))?;
-
-            // Open graph store (shares access.db)
+            // Open graph store (shares access.db) — needed by store, recall, forget
             let graph = GraphStore::open(&ctx_ref.access_db_path)
                 .map_err(|e| sanitize_err("Failed to open graph store", e))?;
 
             let result = match name_ref {
-                "store" => execute_store(&mut db, &tracker, &graph, ctx_ref, args_clone).await,
-                "recall" => execute_recall(&mut db, &tracker, &graph, ctx_ref, args_clone).await,
+                "store" => execute_store(&mut db, &graph, ctx_ref, args_clone).await,
+                "recall" => {
+                    // Access tracker only needed for recall (decay scoring)
+                    let tracker = AccessTracker::open(&ctx_ref.access_db_path)
+                        .map_err(|e| sanitize_err("Failed to open access tracker", e))?;
+                    execute_recall(&mut db, &tracker, &graph, ctx_ref, args_clone).await
+                }
                 "list" => execute_list(&mut db, args_clone).await,
                 "forget" => execute_forget(&mut db, &graph, ctx_ref, args_clone).await,
                 _ => return Ok(CallToolResult::error(format!("Unknown tool: {}", name_ref))),
@@ -272,7 +273,6 @@ fn is_retryable_error(error_msg: &str) -> bool {
 
 async fn execute_store(
     db: &mut Database,
-    _tracker: &AccessTracker,
     graph: &GraphStore,
     ctx: &ServerContext,
     args: Option<Value>,

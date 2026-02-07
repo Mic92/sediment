@@ -70,8 +70,8 @@ impl GraphStore {
                 UNIQUE(from_id, to_id, edge_type)
             );
 
-            CREATE INDEX IF NOT EXISTS idx_edges_from ON graph_edges(from_id);
-            CREATE INDEX IF NOT EXISTS idx_edges_to ON graph_edges(to_id);",
+            CREATE INDEX IF NOT EXISTS idx_edges_from ON graph_edges(from_id, edge_type);
+            CREATE INDEX IF NOT EXISTS idx_edges_to ON graph_edges(to_id, edge_type);",
         )
         .map_err(|e| SedimentError::Database(format!("Failed to create graph tables: {}", e)))?;
 
@@ -295,7 +295,8 @@ impl GraphStore {
              WHERE (from_id IN ({ph}) OR to_id IN ({ph}))
                AND edge_type = 'co_accessed'
                AND count >= ?{min_idx}
-             ORDER BY count DESC"
+             ORDER BY count DESC
+             LIMIT 50"
         );
 
         let mut stmt = self.conn.prepare(&sql).map_err(|e| {
