@@ -617,27 +617,22 @@ impl Database {
                     }
                 }
 
-                // FTS index on content column (no minimum row requirement)
+                // FTS index on content column (no minimum row requirement).
+                // Always replace: LanceDB FTS indexes are not auto-updated on insert,
+                // so we rebuild to ensure newly stored items are searchable.
                 if row_count > 0 {
-                    let has_fts_index = indices
-                        .iter()
-                        .any(|idx| idx.columns.contains(&"content".to_string()));
-
-                    if !has_fts_index {
-                        info!("Creating FTS index on {} table ({} rows)", name, row_count);
-                        match table
-                            .create_index(
-                                &["content"],
-                                lancedb::index::Index::FTS(Default::default()),
-                            )
-                            .execute()
-                            .await
-                        {
-                            Ok(_) => info!("FTS index created on {} table", name),
-                            Err(e) => {
-                                // Non-fatal: vector-only search still works
-                                tracing::warn!("Failed to create FTS index on {}: {}", name, e);
-                            }
+                    match table
+                        .create_index(&["content"], lancedb::index::Index::FTS(Default::default()))
+                        .replace(true)
+                        .execute()
+                        .await
+                    {
+                        Ok(_) => {
+                            debug!("FTS index refreshed on {} table ({} rows)", name, row_count)
+                        }
+                        Err(e) => {
+                            // Non-fatal: vector-only search still works
+                            tracing::warn!("Failed to create FTS index on {}: {}", name, e);
                         }
                     }
                 }
@@ -1375,7 +1370,7 @@ pub async fn migrate_project_id(
 /// Compute a decay-adjusted score for a search result.
 ///
 /// Formula: `similarity * freshness * frequency`
-/// - freshness = 1.0 / (1.0 + age_days / 30.0)  (half-life ~30 days)
+/// - freshness = 1.0 / (1.0 + age_days / 30.0)  (hyperbolic decay, 0.5 at 30 days)
 /// - frequency = 1.0 + 0.1 * ln(1 + access_count)
 ///
 /// `last_accessed_at` and `created_at` are unix timestamps.
