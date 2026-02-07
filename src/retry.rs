@@ -40,10 +40,11 @@ impl Default for RetryConfig {
 }
 
 impl RetryConfig {
-    /// Create a new retry configuration with custom values
+    /// Create a new retry configuration with custom values.
+    /// `max_attempts` is clamped to a minimum of 1.
     pub fn new(max_attempts: u32, initial_delay_ms: u64, max_delay_ms: u64) -> Self {
         Self {
-            max_attempts,
+            max_attempts: max_attempts.max(1),
             initial_delay_ms,
             max_delay_ms,
         }

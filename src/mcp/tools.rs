@@ -288,6 +288,10 @@ async fn execute_store(
         None => return CallToolResult::error("Missing parameters"),
     };
 
+    if params.content.trim().is_empty() {
+        return CallToolResult::error("Content must not be empty");
+    }
+
     // Reject oversized content to prevent OOM during embedding/chunking.
     // Intentionally byte-based (not char-based): memory allocation is proportional
     // to byte length, so this is the correct metric for OOM prevention.
@@ -454,8 +458,9 @@ pub async fn recall_pipeline(
             );
 
             let edge_count = edge_counts.get(&result.id).copied().unwrap_or(0);
-            let trust_bonus =
-                1.0 + 0.05 * (1.0 + validation_count as f64).ln() as f32 + 0.02 * edge_count as f32;
+            let trust_bonus = 1.0
+                + 0.05 * (1.0 + validation_count as f64).ln() as f32
+                + 0.005 * edge_count as f32;
 
             result.similarity = (base_score * trust_bonus).min(1.0);
         }
@@ -586,6 +591,10 @@ async fn execute_recall(
         },
         None => return CallToolResult::error("Missing parameters"),
     };
+
+    if params.query.trim().is_empty() {
+        return CallToolResult::error("Query must not be empty");
+    }
 
     // Reject oversized queries to prevent OOM during tokenization.
     // The model truncates to 512 tokens (~2KB of English text), so anything
