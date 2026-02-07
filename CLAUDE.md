@@ -31,11 +31,10 @@ cargo install --path .
 
 Sediment is a semantic memory system for AI agents, running as an MCP (Model Context Protocol) server. It combines vector search, a property graph, and access tracking into a unified memory intelligence layer.
 
-### Three-Database Hybrid (all local, embedded, zero config)
+### Two-Database Hybrid (all local, embedded, zero config)
 
 - **LanceDB** — Vector embeddings + semantic similarity (items and chunks)
-- **SQLite** (graph) — Relationship tracking: RELATED, SUPERSEDES, CO_ACCESSED, CLUSTER_SIBLING edges
-- **SQLite** (access) — Mutable counters: access tracking, decay scoring, consolidation queue, validation counts
+- **SQLite** (`access.db`) — Graph relationships, access tracking, decay scoring, consolidation queue
 
 ### Core Components
 
@@ -65,7 +64,7 @@ Sediment is a semantic memory system for AI agents, running as an MCP (Model Con
 
 ### Key Design Decisions
 
-- **Three-database hybrid**: LanceDB for vectors, SQLite for graph relationships, SQLite for mutable counters
+- **Two-database hybrid**: LanceDB for vectors, SQLite for graph relationships + mutable counters
 - **Single central database** at `~/.sediment/data/` stores all projects; graph + access at `~/.sediment/access.db`
 - **Project scoping** via UUID stored in `.sediment/config` per project
 - **Similarity boosting**: Same-project items get 1.15x boost, different projects 0.95x penalty
