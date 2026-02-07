@@ -1911,6 +1911,8 @@ mod tests {
             project_id: None,
             items_table: None,
             chunks_table: None,
+            fts_boost_max: FTS_BOOST_MAX,
+            fts_gamma: FTS_GAMMA,
         };
 
         let needs_migration = db.check_needs_migration().await.unwrap();
@@ -1945,6 +1947,8 @@ mod tests {
             project_id: None,
             items_table: None,
             chunks_table: None,
+            fts_boost_max: FTS_BOOST_MAX,
+            fts_gamma: FTS_GAMMA,
         };
 
         let needs_migration = db.check_needs_migration().await.unwrap();
