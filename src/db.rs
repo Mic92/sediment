@@ -70,6 +70,17 @@ const MAX_CHUNKS_PER_ITEM: usize = 200;
 /// Bounds peak memory usage while still batching efficiently.
 const EMBEDDING_BATCH_SIZE: usize = 32;
 
+/// Maximum additive FTS boost applied to vector similarity scores.
+/// With BM25 normalization, the top FTS result gets this full boost.
+/// Set to 0.04 (half the old rank-0 boost of 0.08) because BM25 normalization
+/// clusters boosts closer together, preserving tie-breaking without over-promoting.
+const FTS_BOOST_MAX: f32 = 0.04;
+
+/// Row count threshold below which vector search bypasses the index (brute-force).
+/// Matches the 256-row minimum in `ensure_vector_index()` — once an index exists,
+/// use it instead of brute-force scanning.
+const VECTOR_INDEX_THRESHOLD: usize = 256;
+
 /// Database wrapper for LanceDB
 pub struct Database {
     db: lancedb::Connection,
@@ -768,14 +779,14 @@ impl Database {
         Ok(())
     }
 
-    /// Run a full-text search on the items table and return a map of item_id → rank.
+    /// Run a full-text search on the items table and return a map of item_id → BM25 score.
     /// Returns None if FTS is unavailable (no index or query fails).
     async fn fts_rank_items(
         &self,
         table: &Table,
         query: &str,
         limit: usize,
-    ) -> Option<std::collections::HashMap<String, usize>> {
+    ) -> Option<std::collections::HashMap<String, f32>> {
         let fts_query =
             FullTextSearchQuery::new(query.to_string()).columns(Some(vec!["content".to_string()]));
 
@@ -790,20 +801,22 @@ impl Database {
             .await
             .ok()?;
 
-        let mut ranks = std::collections::HashMap::new();
-        let mut rank = 0usize;
+        let mut scores = std::collections::HashMap::new();
         for batch in fts_results {
             let ids = batch
                 .column_by_name("id")
                 .and_then(|c| c.as_any().downcast_ref::<StringArray>())?;
+            let bm25_scores = batch
+                .column_by_name("_score")
+                .and_then(|c| c.as_any().downcast_ref::<Float32Array>());
             for i in 0..ids.len() {
                 if !ids.is_null(i) {
-                    ranks.insert(ids.value(i).to_string(), rank);
-                    rank += 1;
+                    let score = bm25_scores.map(|s| s.value(i)).unwrap_or(0.0);
+                    scores.insert(ids.value(i).to_string(), score);
                 }
             }
         }
-        Some(ranks)
+        Some(scores)
     }
 
     /// Search items by semantic similarity
@@ -832,7 +845,7 @@ impl Database {
             let base_query = table
                 .vector_search(query_embedding.clone())
                 .map_err(|e| SedimentError::Database(format!("Failed to build search: {}", e)))?;
-            let query_builder = if row_count < 5000 {
+            let query_builder = if row_count < VECTOR_INDEX_THRESHOLD {
                 base_query.bypass_vector_index().limit(limit * 2)
             } else {
                 base_query.refine_factor(10).limit(limit * 2)
@@ -868,14 +881,21 @@ impl Database {
             // Run FTS search for keyword-based ranking signal
             let fts_ranking = self.fts_rank_items(table, query, limit * 2).await;
 
+            // Compute max BM25 score for normalization (once, before the loop)
+            let max_bm25 = fts_ranking
+                .as_ref()
+                .and_then(|scores| scores.values().cloned().reduce(f32::max))
+                .unwrap_or(1.0)
+                .max(f32::EPSILON);
+
             // Apply additive FTS boost before project boosting.
-            // FTS rank 0 gets at most +0.08 similarity — enough to re-rank
-            // near-ties but not enough to override strong semantic signals.
+            // Uses BM25-normalized scores so near-tied items get near-equal boosts,
+            // preventing artificial rank-based spread from distorting results.
             for (item, similarity) in vector_items {
-                let fts_boost = fts_ranking.as_ref().map_or(0.0, |ranks| {
-                    ranks
+                let fts_boost = fts_ranking.as_ref().map_or(0.0, |scores| {
+                    scores
                         .get(&item.id)
-                        .map_or(0.0, |&fts_rank| 0.08 / (1.0 + fts_rank as f32))
+                        .map_or(0.0, |&bm25_score| FTS_BOOST_MAX * (bm25_score / max_bm25))
                 });
                 let boosted_similarity = boost_similarity(
                     similarity + fts_boost,
@@ -896,7 +916,7 @@ impl Database {
             let chunk_base_query = chunks_table.vector_search(query_embedding).map_err(|e| {
                 SedimentError::Database(format!("Failed to build chunk search: {}", e))
             })?;
-            let chunk_results = if chunk_row_count < 5000 {
+            let chunk_results = if chunk_row_count < VECTOR_INDEX_THRESHOLD {
                 chunk_base_query.bypass_vector_index().limit(limit * 3)
             } else {
                 chunk_base_query.refine_factor(10).limit(limit * 3)
@@ -941,9 +961,16 @@ impl Database {
                 }
             }
 
-            // Fetch parent items for chunk matches
+            // Batch-fetch parent items for all chunk matches in a single query
+            let chunk_item_ids: Vec<&str> = chunk_matches.keys().map(|id| id.as_str()).collect();
+            let parent_items = self.get_items_batch(&chunk_item_ids).await?;
+            let parent_map: std::collections::HashMap<&str, &Item> = parent_items
+                .iter()
+                .map(|item| (item.id.as_str(), item))
+                .collect();
+
             for (item_id, (excerpt, chunk_similarity)) in chunk_matches {
-                if let Some(item) = self.get_item(&item_id).await? {
+                if let Some(item) = parent_map.get(item_id.as_str()) {
                     // Apply project boosting
                     let boosted_similarity = boost_similarity(
                         chunk_similarity,
@@ -952,7 +979,7 @@ impl Database {
                     );
 
                     let result =
-                        SearchResult::from_item_with_excerpt(&item, boosted_similarity, excerpt);
+                        SearchResult::from_item_with_excerpt(item, boosted_similarity, excerpt);
 
                     // Update if this chunk-based result is better
                     results_map
@@ -1016,7 +1043,7 @@ impl Database {
         let base_query = table
             .vector_search(embedding.to_vec())
             .map_err(|e| SedimentError::Database(format!("Failed to build search: {}", e)))?;
-        let results = if row_count < 5000 {
+        let results = if row_count < VECTOR_INDEX_THRESHOLD {
             base_query.bypass_vector_index().limit(limit)
         } else {
             base_query.refine_factor(10).limit(limit)
