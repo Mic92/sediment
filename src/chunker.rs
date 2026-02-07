@@ -101,8 +101,8 @@ pub fn chunk_content(
     // Second pass: enforce max size by recursive splitting
     let chunks = enforce_max_size(chunks, config);
 
-    // Third pass: merge small chunks (respecting boundaries)
-    merge_small_chunks(chunks, config.min_chunk_size)
+    // Third pass: merge small chunks (respecting boundaries and max size)
+    merge_small_chunks(chunks, config.min_chunk_size, config.max_chunk_size)
 }
 
 // ============================================================================
@@ -435,8 +435,12 @@ fn enforce_max_size(chunks: Vec<ChunkResult>, config: &ChunkingConfig) -> Vec<Ch
     result
 }
 
-/// Merge small chunks with neighbors, respecting boundaries
-fn merge_small_chunks(chunks: Vec<ChunkResult>, min_size: usize) -> Vec<ChunkResult> {
+/// Merge small chunks with neighbors, respecting boundaries and max size
+fn merge_small_chunks(
+    chunks: Vec<ChunkResult>,
+    min_size: usize,
+    max_size: usize,
+) -> Vec<ChunkResult> {
     if chunks.is_empty() {
         return chunks;
     }
@@ -447,8 +451,9 @@ fn merge_small_chunks(chunks: Vec<ChunkResult>, min_size: usize) -> Vec<ChunkRes
         if chunk.content.len() >= min_size || chunk.is_boundary {
             result.push(chunk);
         } else if let Some(last) = result.last_mut() {
-            // Don't merge across boundaries
-            if !last.is_boundary {
+            // Don't merge across boundaries or if result would exceed max size
+            let merged_len = last.content.len() + 2 + chunk.content.len();
+            if !last.is_boundary && merged_len <= max_size {
                 // Merge with previous chunk
                 last.content.push_str("\n\n");
                 last.content.push_str(&chunk.content);
