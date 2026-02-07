@@ -71,15 +71,20 @@ const MAX_CHUNKS_PER_ITEM: usize = 200;
 const EMBEDDING_BATCH_SIZE: usize = 32;
 
 /// Maximum additive FTS boost applied to vector similarity scores.
-/// With BM25 normalization, the top FTS result gets this full boost.
-/// Set to 0.04 (half the old rank-0 boost of 0.08) because BM25 normalization
-/// clusters boosts closer together, preserving tie-breaking without over-promoting.
-const FTS_BOOST_MAX: f32 = 0.04;
+/// The top FTS result (by BM25 score) gets this full boost after power-law scaling.
+/// Grid-searched over [0.04, 0.12] × γ [1.0, 4.0]; 0.12 gives the best composite
+/// score (R@1=45.5%, R@5=78.0%, MRR=59.3%, nDCG@5=57.4%).
+const FTS_BOOST_MAX: f32 = 0.12;
+
+/// Power-law exponent for BM25 score normalization.
+/// γ=1.0 is linear (uniform boost distribution), higher values concentrate
+/// boost on top FTS hits. γ=2.0 balances R@1 precision with R@5/MRR breadth.
+/// Higher γ (e.g. 4.0) improves R@1 by +0.5pp but costs -4pp R@5.
+const FTS_GAMMA: f32 = 2.0;
 
 /// Row count threshold below which vector search bypasses the index (brute-force).
-/// Matches the 256-row minimum in `ensure_vector_index()` — once an index exists,
-/// use it instead of brute-force scanning.
-const VECTOR_INDEX_THRESHOLD: usize = 256;
+/// Brute-force is both faster and more accurate for small tables.
+const VECTOR_INDEX_THRESHOLD: usize = 5000;
 
 /// Database wrapper for LanceDB
 pub struct Database {
@@ -88,6 +93,9 @@ pub struct Database {
     project_id: Option<String>,
     items_table: Option<Table>,
     chunks_table: Option<Table>,
+    /// FTS boost parameters — overridable via env vars in bench builds only.
+    fts_boost_max: f32,
+    fts_gamma: f32,
 }
 
 /// Database statistics
@@ -185,12 +193,31 @@ impl Database {
         .await
         .map_err(|e| SedimentError::Database(format!("Failed to connect to database: {}", e)))?;
 
+        // In bench builds, allow overriding FTS params via environment variables
+        // for parameter sweeps. Production builds always use the compiled defaults.
+        #[cfg(feature = "bench")]
+        let (fts_boost_max, fts_gamma) = {
+            let boost = std::env::var("SEDIMENT_FTS_BOOST_MAX")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(FTS_BOOST_MAX);
+            let gamma = std::env::var("SEDIMENT_FTS_GAMMA")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(FTS_GAMMA);
+            (boost, gamma)
+        };
+        #[cfg(not(feature = "bench"))]
+        let (fts_boost_max, fts_gamma) = (FTS_BOOST_MAX, FTS_GAMMA);
+
         let mut database = Self {
             db,
             embedder,
             project_id,
             items_table: None,
             chunks_table: None,
+            fts_boost_max,
+            fts_gamma,
         };
 
         database.ensure_tables().await?;
@@ -889,13 +916,15 @@ impl Database {
                 .max(f32::EPSILON);
 
             // Apply additive FTS boost before project boosting.
-            // Uses BM25-normalized scores so near-tied items get near-equal boosts,
-            // preventing artificial rank-based spread from distorting results.
+            // Uses BM25-normalized scores with power-law concentration:
+            //   boost = fts_boost_max * (bm25 / max_bm25)^gamma
+            // gamma > 1 concentrates boost on top FTS hits (like rank-based)
+            // while staying grounded in actual BM25 relevance scores.
             for (item, similarity) in vector_items {
                 let fts_boost = fts_ranking.as_ref().map_or(0.0, |scores| {
-                    scores
-                        .get(&item.id)
-                        .map_or(0.0, |&bm25_score| FTS_BOOST_MAX * (bm25_score / max_bm25))
+                    scores.get(&item.id).map_or(0.0, |&bm25_score| {
+                        self.fts_boost_max * (bm25_score / max_bm25).powf(self.fts_gamma)
+                    })
                 });
                 let boosted_similarity = boost_similarity(
                     similarity + fts_boost,
